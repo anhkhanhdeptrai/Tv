@@ -1,7 +1,7 @@
 {
 "name": "tv-mjpeg-server",
-"version": "1.0.0",
-"description": "Convert HLS TV streams to MJPEG for ESP32",
+"version": "2.0.0",
+"description": "Delayed TV HLS audio/video and MJPEG for ESP32",
 "main": "server.js",
 "scripts": {
 "start": "node server.js"

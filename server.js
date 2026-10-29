@@ -1,462 +1,818 @@
 const express = require("express");
 const { spawn } = require("child_process");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
-const crypto = require("crypto");
 
 const app = express();
+
 const PORT = process.env.PORT || 10000;
+
+// ======================================================
+// CONFIG
+// ======================================================
+
 const DEFAULT_URL =
-"https://amagi-live.ondemandkorea.com/amgplt0456.m3u8";
+  "https://amagi-live.ondemandkorea.com/amgplt0456.m3u8";
 
-const DELAY_SECONDS = Math.max(
-0,
-parseInt(process.env.DELAY_SECONDS || "15", 10) || 0
-);
+const DELAY_SECONDS = 15;
 
+// HLS
 const SEGMENT_SECONDS = 4;
 const HLS_LIST_SIZE = 20;
-const MAX_FRAME_BYTES = 20 * 1024 * 1024;
 
-const sessions = new Map();
+// MJPEG
+const MJPEG_FPS = 8;
+const MJPEG_WIDTH = 320;
+const MJPEG_HEIGHT = 240;
 
-function getSource(req) {
-const value = req.query.url || DEFAULT_URL;
+// ======================================================
+// DIRECTORIES
+// ======================================================
 
-try {
-const u = new URL(value);
-if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-return u.href;
-} catch {
-return null;
+const DATA_DIR = path.join(__dirname, "data");
+const HLS_DIR = path.join(DATA_DIR, "hls");
+
+fs.mkdirSync(HLS_DIR, { recursive: true });
+
+// ======================================================
+// STATE
+// ======================================================
+
+let source = DEFAULT_URL;
+
+let hlsProcess = null;
+let mjpegProcess = null;
+
+let frameCount = 0;
+
+const frameBuffer = [];
+
+const MAX_BUFFER_FRAMES = 200;
+
+// ======================================================
+// HELPERS
+// ======================================================
+
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
 }
+
+function killProcess(proc) {
+  if (!proc) return;
+
+  try {
+    proc.kill("SIGTERM");
+  } catch (_) {}
+
+  setTimeout(() => {
+    try {
+      if (!proc.killed) proc.kill("SIGKILL");
+    } catch (_) {}
+  }, 3000);
 }
 
-function getId(source) {
-return crypto.createHash("sha256").update(source).digest("hex").slice(0, 16);
+function cleanHlsDirectory() {
+  try {
+    if (!fs.existsSync(HLS_DIR)) {
+      fs.mkdirSync(HLS_DIR, { recursive: true });
+      return;
+    }
+
+    for (const file of fs.readdirSync(HLS_DIR)) {
+      try {
+        fs.unlinkSync(path.join(HLS_DIR, file));
+      } catch (_) {}
+    }
+  } catch (err) {
+    console.error("HLS cleanup error:", err.message);
+  }
 }
 
-function createSession(source) {
-const id = getId(source);
+// ======================================================
+// HLS
+// ======================================================
 
-if (sessions.has(id)) {
-const s = sessions.get(id);
-s.lastAccess = Date.now();
-return s;
-}
-
-const dir = path.join(os.tmpdir(), "tv-" + id);
-fs.mkdirSync(dir, { recursive: true });
-
-const s = {
-id,
-source,
-dir,
-lastAccess: Date.now(),
-frames: [],
-frameBytes: 0,
-sequence: 0,
-jpegBuffer: Buffer.alloc(0),
-videoProcess: null,
-hlsProcess: null,
-error: null
-};
-
-sessions.set(id, s);
-
-// Process 1: create HLS with video and audio for the web.
-const hlsArgs = [
-"-hide_banner",
-"-loglevel", "warning",
-"-nostdin",
-"-user_agent", "Mozilla/5.0 TV-Server/1.0",
-"-allowed_extensions", "ALL",
-"-allowed_segment_extensions", "ALL",
-"-rw_timeout", "20000000",
-"-i", source,
-
-"-map", "0:v:0",
-"-map", "0:a:0?",
-"-c:v", "copy",
-"-c:a", "aac",
-"-b:a", "96k",
-"-ac", "2",
-"-f", "hls",
-"-hls_time", String(SEGMENT_SECONDS),
-"-hls_list_size", String(HLS_LIST_SIZE),
-"-hls_delete_threshold", "10",
-"-hls_flags", "delete_segments+append_list",
-"-hls_segment_filename", path.join(dir, "seg_%06d.ts"),
-path.join(dir, "index.m3u8")
-
-];
-
-console.log("Starting HLS with audio:", source);
-
-const hls = spawn("ffmpeg", hlsArgs, {
-stdio: ["ignore", "ignore", "pipe"]
-});
-
-s.hlsProcess = hls;
-
-hls.stderr.on("data", d => {
-console.error("[HLS]", d.toString().trim());
-});
-
-hls.on("error", e => {
-s.error = e.message;
-console.error("[HLS spawn error]", e.message);
-});
-
-hls.on("close", code => {
-console.log("HLS FFmpeg exited:", code);
-if (code !== 0) s.error = "HLS FFmpeg exited with code " + code;
-});
-
-// Process 2: create MJPEG for the ESP32-S3.
-const mjpegArgs = [
-"-hide_banner",
-"-loglevel", "warning",
-"-nostdin",
-"-user_agent", "Mozilla/5.0 TV-Server/1.0",
-"-allowed_extensions", "ALL",
-"-allowed_segment_extensions", "ALL",
-"-rw_timeout", "20000000",
-"-i", source,
-"-map", "0:v:0",
-"-an",
-"-sn",
-"-dn",
-"-vf",
-"fps=8,scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2",
-"-q:v", "8",
-"-f", "image2pipe",
-"-vcodec", "mjpeg",
-"pipe:1"
-];
-
-console.log("Starting MJPEG:", source);
-
-const video = spawn("ffmpeg", mjpegArgs, {
-stdio: ["ignore", "pipe", "pipe"]
-});
-
-s.videoProcess = video;
-
-video.stdout.on("data", chunk => {
-s.jpegBuffer = Buffer.concat([s.jpegBuffer, chunk]);
-
-while (true) {
-  const start = s.jpegBuffer.indexOf(Buffer.from([0xff, 0xd8]));
-
-  if (start < 0) {
-    s.jpegBuffer = s.jpegBuffer.slice(-1);
-    break;
+function startHLS() {
+  if (hlsProcess) {
+    log("[HLS] Already running");
+    return;
   }
 
-  const end = s.jpegBuffer.indexOf(
-    Buffer.from([0xff, 0xd9]),
-    start + 2
+  cleanHlsDirectory();
+
+  log("[HLS] Starting:", source);
+
+  const segmentPattern = path.join(
+    HLS_DIR,
+    "seg-%03d.ts"
   );
 
-  if (end < 0) {
-    if (start > 0) s.jpegBuffer = s.jpegBuffer.slice(start);
-    break;
-  }
+  const args = [
+    "-hide_banner",
 
-  const jpeg = Buffer.from(s.jpegBuffer.subarray(start, end + 2));
-  s.jpegBuffer = s.jpegBuffer.subarray(end + 2);
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
 
-  s.sequence++;
-  s.frames.push({
-    seq: s.sequence,
-    time: Date.now(),
-    data: jpeg
+    "-allowed_extensions",
+    "ALL",
+    "-allowed_segment_extensions",
+    "ALL",
+
+    "-i",
+    source,
+
+    // Video
+    "-map",
+    "0:v:0",
+
+    // Audio nếu nguồn có audio
+    "-map",
+    "0:a:0?",
+
+    // Giữ nguyên video để giảm CPU
+    "-c:v",
+    "copy",
+
+    // Chuyển audio sang AAC cho trình duyệt
+    "-c:a",
+    "aac",
+    "-b:a",
+    "96k",
+    "-ac",
+    "2",
+
+    "-f",
+    "hls",
+
+    "-hls_time",
+    String(SEGMENT_SECONDS),
+
+    "-hls_list_size",
+    String(HLS_LIST_SIZE),
+
+    "-hls_delete_threshold",
+    "10",
+
+    "-hls_flags",
+    "delete_segments+append_list",
+
+    "-hls_segment_filename",
+    segmentPattern,
+
+    path.join(HLS_DIR, "index.m3u8")
+  ];
+
+  hlsProcess = spawn("ffmpeg", args, {
+    stdio: ["ignore", "pipe", "pipe"]
   });
-  s.frameBytes += jpeg.length;
 
-  const cutoff = Date.now() - Math.max(30000, (DELAY_SECONDS + 15) * 1000);
+  hlsProcess.stdout.on("data", (data) => {
+    process.stdout.write(`[HLS] ${data}`);
+  });
 
-  while (
-    s.frames.length &&
-    (s.frames[0].time < cutoff || s.frameBytes > MAX_FRAME_BYTES)
+  hlsProcess.stderr.on("data", (data) => {
+    process.stdout.write(`[HLS] ${data}`);
+  });
+
+  hlsProcess.on("error", (err) => {
+    console.error("[HLS] Process error:", err.message);
+  });
+
+  hlsProcess.on("close", (code, signal) => {
+    log(
+      `[HLS] FFmpeg exited code=${code} signal=${signal}`
+    );
+
+    hlsProcess = null;
+
+    setTimeout(() => {
+      startHLS();
+    }, 3000);
+  });
+}
+
+// ======================================================
+// MJPEG
+// ======================================================
+
+function startMJPEG() {
+  if (mjpegProcess) {
+    log("[MJPEG] Already running");
+    return;
+  }
+
+  log("[MJPEG] Starting:", source);
+
+  const args = [
+    "-hide_banner",
+
+    "-loglevel",
+    "warning",
+
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+
+    "-allowed_extensions",
+    "ALL",
+    "-allowed_segment_extensions",
+    "ALL",
+
+    "-i",
+    source,
+
+    "-an",
+
+    "-vf",
+    `fps=${MJPEG_FPS},scale=${MJPEG_WIDTH}:${MJPEG_HEIGHT}:force_original_aspect_ratio=decrease,pad=${MJPEG_WIDTH}:${MJPEG_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+
+    "-q:v",
+    "8",
+
+    "-f",
+    "image2pipe",
+
+    "-vcodec",
+    "mjpeg",
+
+    "pipe:1"
+  ];
+
+  mjpegProcess = spawn("ffmpeg", args, {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  let buffer = Buffer.alloc(0);
+
+  mjpegProcess.stdout.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+
+    while (true) {
+      const start = buffer.indexOf(
+        Buffer.from([0xff, 0xd8])
+      );
+
+      if (start === -1) {
+        break;
+      }
+
+      const end = buffer.indexOf(
+        Buffer.from([0xff, 0xd9]),
+        start + 2
+      );
+
+      if (end === -1) {
+        break;
+      }
+
+      const jpeg = buffer.slice(
+        start,
+        end + 2
+      );
+
+      buffer = buffer.slice(end + 2);
+
+      frameCount++;
+
+      frameBuffer.push({
+        time: Date.now(),
+        data: jpeg
+      });
+
+      while (frameBuffer.length > MAX_BUFFER_FRAMES) {
+        frameBuffer.shift();
+      }
+    }
+  });
+
+  mjpegProcess.stderr.on("data", (data) => {
+    process.stdout.write(`[MJPEG] ${data}`);
+  });
+
+  mjpegProcess.on("error", (err) => {
+    console.error(
+      "[MJPEG] Process error:",
+      err.message
+    );
+  });
+
+  mjpegProcess.on("close", (code, signal) => {
+    log(
+      `[MJPEG] FFmpeg exited code=${code} signal=${signal}; frames=${frameCount}`
+    );
+
+    mjpegProcess = null;
+
+    setTimeout(() => {
+      startMJPEG();
+    }, 3000);
+  });
+}
+
+// ======================================================
+// HLS PLAYLIST DELAY
+// ======================================================
+
+function getDelayedPlaylist() {
+  const playlistPath = path.join(
+    HLS_DIR,
+    "index.m3u8"
+  );
+
+  if (!fs.existsSync(playlistPath)) {
+    return null;
+  }
+
+  let playlist = fs.readFileSync(
+    playlistPath,
+    "utf8"
+  );
+
+  const lines = playlist
+    .split("\n")
+    .filter(Boolean);
+
+  const targetSegments = Math.ceil(
+    DELAY_SECONDS / SEGMENT_SECONDS
+  );
+
+  const output = [];
+
+  let segmentCount = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith("#EXTINF:")) {
+      segmentCount++;
+
+      // Chờ đủ segment để tạo delay
+      if (segmentCount <= targetSegments) {
+        continue;
+      }
+
+      output.push(line);
+
+      if (i + 1 < lines.length) {
+        output.push(lines[++i]);
+      }
+
+      continue;
+    }
+
+    if (
+      line.startsWith("#EXTM3U") ||
+      line.startsWith("#EXT-X-VERSION") ||
+      line.startsWith("#EXT-X-TARGETDURATION") ||
+      line.startsWith("#EXT-X-MEDIA-SEQUENCE") ||
+      line.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE")
+    ) {
+      output.push(line);
+    }
+  }
+
+  if (
+    !output.some((line) =>
+      line.startsWith("#EXT-X-TARGETDURATION")
+    )
   ) {
-    const old = s.frames.shift();
-    s.frameBytes -= old.data.length;
+    return playlist;
   }
 
-  if (s.sequence === 1) {
-    console.log("First MJPEG frame:", jpeg.length, "bytes");
-  }
+  return output.join("\n") + "\n";
 }
 
-});
-
-video.stderr.on("data", d => {
-console.error("[MJPEG]", d.toString().trim());
-});
-
-video.on("error", e => {
-s.error = e.message;
-console.error("[MJPEG spawn error]", e.message);
-});
-
-video.on("close", code => {
-console.log("MJPEG FFmpeg exited:", code);
-});
-
-return s;
-}
-
-function delayedPlaylist(s) {
-const file = path.join(s.dir, "index.m3u8");
-if (!fs.existsSync(file)) return null;
-
-let lines;
-
-try {
-lines = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
-} catch {
-return null;
-}
-
-const segmentLineIndexes = [];
-
-for (let i = 0; i < lines.length; i++) {
-if (!lines[i].startsWith("#")) segmentLineIndexes.push(i);
-}
-
-const delayCount = Math.ceil(DELAY_SECONDS / SEGMENT_SECONDS);
-
-// Hide the newest segments to introduce a playback delay.
-if (delayCount > 0 && segmentLineIndexes.length > delayCount + 2) {
-const keepCount = segmentLineIndexes.length - delayCount;
-lines = lines.slice(0, segmentLineIndexes[keepCount - 1] + 1);
-}
-
-return lines.map(line => {
-if (line.startsWith("#")) return line;
-
-const filename = path.basename(line);
-return "/hls-segment/" + s.id + "/" + encodeURIComponent(filename);
-
-}).join("\n") + "\n";
-}
+// ======================================================
+// ROUTES
+// ======================================================
 
 app.get("/health", (req, res) => {
-res.json({
-ok: true,
-delaySeconds: DELAY_SECONDS,
-sessions: sessions.size
+  res.json({
+    ok: true,
+    source,
+    hls: !!hlsProcess,
+    mjpeg: !!mjpegProcess,
+    frames: frameCount,
+    bufferFrames: frameBuffer.length,
+    delaySeconds: DELAY_SECONDS
+  });
 });
-});
+
+// ======================================================
+// WEB PLAYER
+// ======================================================
 
 app.get("/", (req, res) => {
-const source = getSource(req) || DEFAULT_URL;
-const safeSource = source.replace(/&/g, "&").replace(/"/g, """);
+  const safeSource = String(source)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;");
 
-res.type("html").send(`<!doctype html>
-
+  res.send(`
+<!DOCTYPE html>
 <html lang="vi">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TV Online</title>
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1"
+/>
+
+<title>TV Stream</title>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+
 <style>
-body{background:#111;color:#eee;font-family:Arial,sans-serif;text-align:center;margin:0}
-main{max-width:800px;margin:auto;padding:16px}
-video{width:100%;background:#000}
-input{box-sizing:border-box;width:100%;padding:12px}
-button{padding:12px;margin:8px}
+html,body {
+  margin:0;
+  padding:0;
+  background:#000;
+  color:#fff;
+  font-family:Arial,sans-serif;
+}
+
+body {
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+}
+
+h2 {
+  margin:15px 0;
+}
+
+video {
+  width:100%;
+  max-width:900px;
+  height:auto;
+  background:#000;
+}
+
+.info {
+  width:100%;
+  max-width:900px;
+  padding:12px;
+  box-sizing:border-box;
+  text-align:center;
+}
+
+button {
+  padding:12px 20px;
+  border:0;
+  border-radius:6px;
+  font-size:16px;
+}
 </style>
 </head>
+
 <body>
-<main>
+
 <h2>TV Online</h2>
-<form id="form">
-<input id="url" value="${safeSource}">
-<button type="submit">Mở kênh</button>
-</form>
-<video id="video" controls playsinline></video>
-<p id="status">Đang tải playlist...</p>
-<p>Độ trễ mục tiêu: ${DELAY_SECONDS} giây</p>
-<p><a style="color:#8cf" href="/stream?url=${encodeURIComponent(source)}">Luồng MJPEG cho ESP32</a></p>
-</main>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+
+<video
+  id="video"
+  controls
+  playsinline
+  preload="auto">
+</video>
+
+<div class="info">
+  <button id="play">▶ Phát</button>
+  <p>
+    Nếu trình duyệt yêu cầu, hãy bấm Phát để kích hoạt âm thanh.
+  </p>
+</div>
+
 <script>
+
 const video = document.getElementById("video");
-const input = document.getElementById("url");
-const statusText = document.getElementById("status");
-let player = null;function startTV() {
-const source = input.value.trim();
+const playButton = document.getElementById("play");
 
-if (!(source.startsWith("https://") || source.startsWith("http://"))) {
-statusText.textContent = "URL không hợp lệ";
-return;
-}
+const source = "${safeSource}";
 
-if (player) {
-player.destroy();
-player = null;
-}
+function startPlayer() {
 
-video.pause();
-video.removeAttribute("src");
-video.load();
+  if (video.canPlayType("application/vnd.apple.mpegurl")) {
 
-const playlist = "/hls?url=" + encodeURIComponent(source);
+    video.src = "/hls";
 
-if (window.Hls && Hls.isSupported()) {
-player = new Hls({
-lowLatencyMode: false,
-liveSyncDurationCount: 8,
-maxBufferLength: 30,
-backBufferLength: 30
-});
+    video.addEventListener(
+      "loadedmetadata",
+      () => {
+        console.log("HLS loaded");
+      }
+    );
 
-player.loadSource(playlist);
-player.attachMedia(video);
+  } else if (Hls.isSupported()) {
 
-player.on(Hls.Events.MANIFEST_PARSED, () => {
-  statusText.textContent = "Đã tải luồng. Nhấn Play để nghe tiếng.";
-});
+    const hls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,
 
-player.on(Hls.Events.ERROR, (event, data) => {
-  if (data.fatal) {
-    statusText.textContent = "Lỗi HLS: " + data.details;
+      maxBufferLength: 30,
+      maxMaxBufferLength: 60,
+
+      backBufferLength: 30,
+
+      liveSyncDurationCount: 3,
+
+      liveMaxLatencyDurationCount: 8
+    });
+
+    hls.loadSource("/hls");
+    hls.attachMedia(video);
+
+    hls.on(
+      Hls.Events.MANIFEST_PARSED,
+      function () {
+        console.log("HLS manifest loaded");
+      }
+    );
+
+    hls.on(
+      Hls.Events.ERROR,
+      function (event, data) {
+        console.log("HLS error:", data);
+
+        if (
+          data.fatal &&
+          data.type === Hls.ErrorTypes.NETWORK_ERROR
+        ) {
+          console.log("Retry HLS network");
+          hls.startLoad();
+        }
+
+        if (
+          data.fatal &&
+          data.type === Hls.ErrorTypes.MEDIA_ERROR
+        ) {
+          console.log("Recover media");
+          hls.recoverMediaError();
+        }
+      }
+    );
+
+  } else {
+
+    alert(
+      "Trình duyệt không hỗ trợ HLS."
+    );
   }
-});
-
-} else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-video.src = playlist;
-} else {
-statusText.textContent = "Trình duyệt không hỗ trợ HLS.";
-}
 }
 
-document.getElementById("form").addEventListener("submit", event => {
-event.preventDefault();
-startTV();
-});
+playButton.addEventListener(
+  "click",
+  async () => {
 
-startTV();
+    try {
+
+      await video.play();
+
+      playButton.style.display =
+        "none";
+
+    } catch (err) {
+
+      console.error(err);
+
+      alert(
+        "Không thể phát. Hãy bấm Play trên video."
+      );
+    }
+  }
+);
+
+startPlayer();
+
 </script>
 
 </body>
-</html>`);
-});app.get("/hls", (req, res) => {
-const source = getSource(req);
-if (!source) return res.status(400).send("Invalid stream URL");
+</html>
+  `);
+});
 
-const s = createSession(source);
-s.lastAccess = Date.now();
+// ======================================================
+// HLS PLAYLIST
+// ======================================================
 
-const playlist = delayedPlaylist(s);
+app.get("/hls", (req, res) => {
 
-res.setHeader("Cache-Control", "no-cache, no-store");
-res.setHeader("Access-Control-Allow-Origin", "*");
+  const playlist = getDelayedPlaylist();
 
-if (!playlist) {
-res.setHeader("Retry-After", "2");
-return res.status(503).type("text").send(
-s.error || "Đang chờ FFmpeg tạo playlist..."
+  if (!playlist) {
+
+    res.status(503).send(
+      "#EXTM3U\n#EXT-X-VERSION:3\n"
+    );
+
+    return;
+  }
+
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.apple.mpegurl"
+  );
+
+  res.setHeader(
+    "Cache-Control",
+    "no-cache, no-store, must-revalidate"
+  );
+
+  res.setHeader(
+    "Pragma",
+    "no-cache"
+  );
+
+  res.send(playlist);
+});
+
+// ======================================================
+// HLS SEGMENTS
+// ======================================================
+
+app.get(
+  "/hls-segment/:file",
+  (req, res) => {
+
+    const file = path.basename(
+      req.params.file
+    );
+
+    const filePath = path.join(
+      HLS_DIR,
+      file
+    );
+
+    if (!fs.existsSync(filePath)) {
+      res.status(404).end();
+      return;
+    }
+
+    res.setHeader(
+      "Content-Type",
+      "video/mp2t"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-cache"
+    );
+
+    fs.createReadStream(
+      filePath
+    ).pipe(res);
+  }
 );
-}
 
-res.type("application/vnd.apple.mpegurl").send(playlist);
-});
-
-app.get("/hls-segment/:id/:file", (req, res) => {
-const s = sessions.get(req.params.id);
-if (!s) return res.status(404).send("Session not found");
-
-const filename = path.basename(req.params.file);
-
-if (!/^seg_[0-9]+.ts$/.test(filename)) {
-return res.status(400).send("Invalid segment name");
-}
-
-const file = path.join(s.dir, filename);
-if (!fs.existsSync(file)) return res.status(404).send("Segment not ready");
-
-s.lastAccess = Date.now();
-res.setHeader("Content-Type", "video/mp2t");
-res.setHeader("Cache-Control", "public, max-age=1");
-res.sendFile(file);
-});
+// ======================================================
+// MJPEG STREAM
+// ======================================================
 
 app.get("/stream", (req, res) => {
-const source = getSource(req);
-if (!source) return res.status(400).send("Invalid stream URL");
 
-const s = createSession(source);
-s.lastAccess = Date.now();
+  res.writeHead(200, {
+    "Content-Type":
+      "multipart/x-mixed-replace; boundary=frame",
 
-res.writeHead(200, {
-"Content-Type": "multipart/x-mixed-replace; boundary=frame",
-"Cache-Control": "no-cache, no-store",
-"Access-Control-Allow-Origin": "*",
-"Connection": "keep-alive"
-});
+    "Cache-Control":
+      "no-cache, no-store, must-revalidate",
 
-let lastSeq = -1;
+    "Pragma":
+      "no-cache",
 
-const timer = setInterval(() => {
-if (res.destroyed || res.writableEnded) {
-clearInterval(timer);
-return;
-}
+    "Connection":
+      "close",
 
-const targetTime = Date.now() - DELAY_SECONDS * 1000;
-let selected = null;
+    "Access-Control-Allow-Origin":
+      "*"
+  });
 
-for (let i = s.frames.length - 1; i >= 0; i--) {
-  if (s.frames[i].time <= targetTime) {
-    selected = s.frames[i];
-    break;
+  let closed = false;
+
+  req.on("close", () => {
+    closed = true;
+  });
+
+  function sendFrame() {
+
+    if (closed) return;
+
+    const targetTime =
+      Date.now() -
+      DELAY_SECONDS * 1000;
+
+    let selected = null;
+
+    // Tìm frame đã đủ thời gian delay
+    for (let i = 0; i < frameBuffer.length; i++) {
+
+      if (
+        frameBuffer[i].time <= targetTime
+      ) {
+        selected = frameBuffer[i];
+      } else {
+        break;
+      }
+    }
+
+    if (selected) {
+
+      try {
+
+        res.write(
+          "--frame\r\n" +
+          "Content-Type: image/jpeg\r\n" +
+          "Content-Length: " +
+          selected.data.length +
+          "\r\n\r\n"
+        );
+
+        res.write(selected.data);
+
+        res.write("\r\n");
+
+      } catch (_) {
+
+        closed = true;
+        return;
+      }
+    }
+
+    setTimeout(
+      sendFrame,
+      1000 / MJPEG_FPS
+    );
   }
-}
 
-if (!selected || selected.seq <= lastSeq) return;
-
-lastSeq = selected.seq;
-s.lastAccess = Date.now();
-
-res.write("--frame\r\n");
-res.write("Content-Type: image/jpeg\r\n");
-res.write("Content-Length: " + selected.data.length + "\r\n\r\n");
-res.write(selected.data);
-res.write("\r\n");
-
-}, 100);
-
-res.on("close", () => clearInterval(timer));
+  sendFrame();
 });
 
-setInterval(() => {
-const now = Date.now();
+// ======================================================
+// 404
+// ======================================================
 
-for (const [id, s] of sessions.entries()) {
-if (now - s.lastAccess < 5 * 60 * 1000) continue;
-
-for (const child of [s.videoProcess, s.hlsProcess]) {
-  if (child && child.exitCode === null) child.kill("SIGTERM");
-}
-
-try {
-  fs.rmSync(s.dir, { recursive: true, force: true });
-} catch (e) {
-  console.error("Cleanup error:", e.message);
-}
-
-sessions.delete(id);
-
-}
-}, 60000).unref();
-
-app.listen(PORT, "0.0.0.0", () => {
-console.log("TV server listening on port", PORT);
-console.log("Default stream:", DEFAULT_URL);
-console.log("Delay:", DELAY_SECONDS, "seconds");
+app.use((req, res) => {
+  res.status(404).send("Not found");
 });
+
+// ======================================================
+// START
+// ======================================================
+
+app.listen(PORT, () => {
+
+  log(
+    `Server running on port ${PORT}`
+  );
+
+  log(
+    `Source: ${source}`
+  );
+
+  log(
+    `HLS: /hls`
+  );
+
+  log(
+    `MJPEG: /stream`
+  );
+
+  log(
+    `Delay: ${DELAY_SECONDS}s`
+  );
+
+  startHLS();
+  startMJPEG();
+});
+
+// ======================================================
+// SHUTDOWN
+// ======================================================
+
+function shutdown() {
+
+  log("Shutting down...");
+
+  killProcess(hlsProcess);
+  killProcess(mjpegProcess);
+
+  process.exit(0);
+}
+
+process.on(
+  "SIGTERM",
+  shutdown
+);
+
+process.on(
+  "SIGINT",
+  shutdown
+);
+

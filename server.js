@@ -17,7 +17,11 @@ const WIDTH = 320;
 const HEIGHT = 240;
 const FPS = 10;
 
-const DELAY_SECONDS = 5;
+// Delay MJPEG
+const DELAY_SECONDS = 10;
+
+// Buffer phải lớn hơn delay
+const BUFFER_SECONDS = 14;
 
 const HLS_TIME = 2;
 const HLS_LIST = 8;
@@ -36,21 +40,17 @@ try {
 
 
 // ======================================================
-// FRAME BUFFER
-// ======================================================
-//
-// Chỉ giữ khoảng 7 giây.
-// Không giữ hàng chục giây để tránh bị trễ.
+// MJPEG BUFFER
 // ======================================================
 
 const MAX_BUFFER_FRAMES =
-  FPS * 7;
+  FPS * BUFFER_SECONDS;
 
 let frames = [];
 
 
 // ======================================================
-// START ONE FFMPEG
+// FFMPEG
 // ======================================================
 
 const playlist =
@@ -64,55 +64,32 @@ console.log("Starting FFmpeg...");
 const ffmpeg = spawn("ffmpeg", [
 
   "-hide_banner",
+  "-loglevel", "warning",
 
-  "-loglevel",
-  "warning",
-
-  // ====================================================
-  // INPUT RECONNECT
-  // ====================================================
-
-  "-reconnect",
-  "1",
-
-  "-reconnect_streamed",
-  "1",
-
-  "-reconnect_delay_max",
-  "5",
+  // Reconnect
+  "-reconnect", "1",
+  "-reconnect_streamed", "1",
+  "-reconnect_delay_max", "5",
 
   // Giảm input buffering
-  "-fflags",
-  "nobuffer",
+  "-fflags", "nobuffer",
 
-  "-i",
-  SOURCE,
+  "-i", SOURCE,
 
 
   // ====================================================
-  // OUTPUT 1
-  // HLS
+  // OUTPUT 1: HLS
   // ====================================================
 
-  "-map",
-  "0:v:0",
+  "-map", "0:v:0",
+  "-map", "0:a:0?",
 
-  "-map",
-  "0:a:0?",
+  "-c:v", "copy",
 
-  // Video HLS giữ nguyên
-  "-c:v",
-  "copy",
+  "-c:a", "aac",
+  "-b:a", "96k",
 
-  // Audio AAC
-  "-c:a",
-  "aac",
-
-  "-b:a",
-  "96k",
-
-  "-f",
-  "hls",
+  "-f", "hls",
 
   "-hls_time",
   String(HLS_TIME),
@@ -133,23 +110,26 @@ const ffmpeg = spawn("ffmpeg", [
 
 
   // ====================================================
-  // OUTPUT 2
-  // MJPEG
+  // OUTPUT 2: MJPEG
   // ====================================================
 
-  "-map",
-  "0:v:0",
+  "-map", "0:v:0",
 
   "-an",
 
+  // Chính xác 10 FPS
   "-vf",
   `fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
 
   "-c:v",
   "mjpeg",
 
+  // JPEG vừa đủ đẹp, giảm CPU/network
   "-q:v",
   "8",
+
+  "-fps_mode",
+  "cfr",
 
   "-f",
   "image2pipe",
@@ -198,10 +178,9 @@ ffmpeg.stdout.on("data", chunk => {
     chunk
   ]);
 
-
   while (true) {
 
-    // Tìm JPEG START
+    // JPEG START
     const start =
       jpegBuffer.indexOf(
         Buffer.from([0xff, 0xd8])
@@ -211,7 +190,7 @@ ffmpeg.stdout.on("data", chunk => {
 
       if (
         jpegBuffer.length >
-        1024 * 1024
+        2 * 1024 * 1024
       ) {
         jpegBuffer =
           Buffer.alloc(0);
@@ -220,16 +199,13 @@ ffmpeg.stdout.on("data", chunk => {
       break;
     }
 
-
-    // Bỏ dữ liệu rác trước JPEG
+    // Bỏ dữ liệu rác
     if (start > 0) {
-
       jpegBuffer =
         jpegBuffer.slice(start);
     }
 
-
-    // Tìm JPEG END
+    // JPEG END
     const end =
       jpegBuffer.indexOf(
         Buffer.from([0xff, 0xd9]),
@@ -240,8 +216,6 @@ ffmpeg.stdout.on("data", chunk => {
       break;
     }
 
-
-    // Lấy nguyên JPEG
     const jpeg =
       Buffer.from(
         jpegBuffer.slice(
@@ -250,8 +224,6 @@ ffmpeg.stdout.on("data", chunk => {
         )
       );
 
-
-    // Xóa JPEG đã đọc
     jpegBuffer =
       jpegBuffer.slice(
         end + 2
@@ -270,14 +242,6 @@ ffmpeg.stdout.on("data", chunk => {
     }
 
 
-    // ==================================================
-    // DROP FRAME
-    // ==================================================
-    //
-    // Nếu buffer đã đầy thì bỏ frame CŨ.
-    // Không để video tích tụ thành 1 phút.
-    // ==================================================
-
     const now =
       Date.now();
 
@@ -288,29 +252,29 @@ ffmpeg.stdout.on("data", chunk => {
     });
 
 
+    // ==================================================
+    // GIỮ BUFFER ~14 GIÂY
+    // ==================================================
+
+    const oldest =
+      now -
+      BUFFER_SECONDS * 1000;
+
     while (
-      frames.length >
-      MAX_BUFFER_FRAMES
+      frames.length > 0 &&
+      frames[0].time < oldest
     ) {
       frames.shift();
     }
 
 
     // ==================================================
-    // QUAN TRỌNG:
-    // Nếu buffer vượt quá 6 giây,
-    // bỏ frame cũ để bắt kịp live.
+    // GIỚI HẠN SỐ FRAME
     // ==================================================
 
-    const maxAge =
-      6000;
-
-    const minTime =
-      now - maxAge;
-
     while (
-      frames.length > 0 &&
-      frames[0].time < minTime
+      frames.length >
+      MAX_BUFFER_FRAMES
     ) {
       frames.shift();
     }
@@ -321,13 +285,12 @@ ffmpeg.stdout.on("data", chunk => {
 
 
 // ======================================================
-// WEB PAGE
+// WEB
 // ======================================================
 
 app.get("/", (req, res) => {
 
   res.send(`
-
 <!DOCTYPE html>
 
 <html lang="vi">
@@ -391,41 +354,36 @@ video {
 
 <div class="container">
 
+  <div class="box">
 
-<div class="box">
+    <h2>HLS - Video + Audio</h2>
 
-<h2>
-HLS - Video + Audio
-</h2>
+    <video
+      id="video"
+      controls
+      autoplay
+      playsinline>
+    </video>
 
-<video
-  id="video"
-  controls
-  autoplay
-  playsinline>
-</video>
-
-</div>
+  </div>
 
 
-<div class="box">
+  <div class="box">
 
-<h2>
-MJPEG - ESP32
-</h2>
+    <h2>MJPEG - ESP32</h2>
 
-<div class="info">
-320x240 / 10 FPS / delay ~5 giây
-</div>
+    <div class="info">
+      320×240 / 10 FPS / delay ~10 giây
+    </div>
 
-<img
-  class="mjpeg"
-  src="/stream"
-  width="320"
-  height="240">
+    <img
+      class="mjpeg"
+      src="/stream"
+      width="320"
+      height="240"
+      alt="MJPEG">
 
-</div>
-
+  </div>
 
 </div>
 
@@ -438,7 +396,6 @@ const video =
   document.getElementById("video");
 
 const url = "/hls";
-
 
 if (
   video.canPlayType(
@@ -465,20 +422,14 @@ if (
 
     });
 
-
   hls.loadSource(url);
 
   hls.attachMedia(video);
 
-
   hls.on(
     Hls.Events.MANIFEST_PARSED,
     () => {
-
-      video
-        .play()
-        .catch(() => {});
-
+      video.play().catch(() => {});
     }
   );
 
@@ -489,30 +440,22 @@ if (
 </body>
 
 </html>
-
   `);
 
 });
 
 
 // ======================================================
-// HLS PLAYLIST
+// HLS
 // ======================================================
 
 app.get("/hls", (req, res) => {
 
-  if (
-    !fs.existsSync(playlist)
-  ) {
-
+  if (!fs.existsSync(playlist)) {
     return res
       .status(503)
-      .send(
-        "HLS chưa sẵn sàng"
-      );
-
+      .send("HLS chưa sẵn sàng");
   }
-
 
   try {
 
@@ -522,25 +465,21 @@ app.get("/hls", (req, res) => {
         "utf8"
       );
 
-
     data =
       data.replace(
         /^([^#\r\n]+\.ts)$/gm,
         "/hls-segment/$1"
       );
 
-
     res.setHeader(
       "Content-Type",
       "application/vnd.apple.mpegurl"
     );
 
-
     res.setHeader(
       "Cache-Control",
       "no-cache, no-store, must-revalidate"
     );
-
 
     res.send(data);
 
@@ -550,17 +489,14 @@ app.get("/hls", (req, res) => {
 
     res
       .status(500)
-      .send(
-        "Không đọc được HLS"
-      );
-
+      .send("Không đọc được HLS");
   }
 
 });
 
 
 // ======================================================
-// HLS SEGMENT
+// HLS SEGMENTS
 // ======================================================
 
 app.get(
@@ -572,36 +508,27 @@ app.get(
         req.params.file
       );
 
-
     const filePath =
       path.join(
         HLS_DIR,
         file
       );
 
-
-    if (
-      !fs.existsSync(filePath)
-    ) {
-
+    if (!fs.existsSync(filePath)) {
       return res
         .status(404)
         .send("Not found");
-
     }
-
 
     res.setHeader(
       "Content-Type",
       "video/mp2t"
     );
 
-
     res.setHeader(
       "Cache-Control",
       "no-cache"
     );
-
 
     res.sendFile(filePath);
 
@@ -610,7 +537,7 @@ app.get(
 
 
 // ======================================================
-// MJPEG STREAM
+// MJPEG /stream
 // ======================================================
 
 app.get(
@@ -619,30 +546,25 @@ app.get(
 
     res.statusCode = 200;
 
-
     res.setHeader(
       "Content-Type",
       "multipart/x-mixed-replace; boundary=frame"
     );
-
 
     res.setHeader(
       "Cache-Control",
       "no-cache, no-store, must-revalidate"
     );
 
-
     res.setHeader(
       "Pragma",
       "no-cache"
     );
 
-
     res.setHeader(
       "Connection",
       "keep-alive"
     );
-
 
     if (
       typeof res.flushHeaders ===
@@ -682,7 +604,6 @@ app.get(
             clearInterval(timer);
 
             return;
-
           }
 
 
@@ -694,7 +615,7 @@ app.get(
 
 
           // ============================================
-          // CHỌN FRAME CÁCH LIVE ~5 GIÂY
+          // MỐC 10 GIÂY TRƯỚC
           // ============================================
 
           const target =
@@ -704,6 +625,9 @@ app.get(
 
           let selected = null;
 
+
+          // Chọn frame mới nhất
+          // nhưng không vượt quá target
 
           for (
             let i =
@@ -721,27 +645,22 @@ app.get(
                 frames[i];
 
               break;
-
             }
 
           }
 
 
-          // Nếu chưa đủ 5 giây
+          // Nếu buffer chưa đủ 10 giây
+          // lấy frame cũ nhất hiện có
           if (!selected) {
 
             selected =
-              frames[
-                frames.length - 1
-              ];
+              frames[0];
 
           }
 
 
-          // =========================================
-          // Không gửi trùng
-          // =========================================
-
+          // Không gửi lại cùng frame
           if (
             selected.time ===
             lastSentTime
@@ -754,9 +673,9 @@ app.get(
             selected.time;
 
 
-          // =========================================
-          // MJPEG STANDARD
-          // =========================================
+          // ==========================================
+          // MJPEG
+          // ==========================================
 
           try {
 
@@ -781,7 +700,6 @@ app.get(
             res.write(
               "\r\n"
             );
-
 
           } catch (err) {
 
@@ -824,8 +742,11 @@ app.get(
 
         fps: FPS,
 
-        delay:
+        delaySeconds:
           DELAY_SECONDS,
+
+        bufferSeconds:
+          BUFFER_SECONDS,
 
         frames:
           frames.length
@@ -850,7 +771,7 @@ app.get(
 
 
 // ======================================================
-// START SERVER
+// START
 // ======================================================
 
 const server =
@@ -872,6 +793,12 @@ const server =
         "MJPEG: /stream"
       );
 
+      console.log(
+        "MJPEG delay: " +
+        DELAY_SECONDS +
+        " seconds"
+      );
+
     }
   );
 
@@ -886,23 +813,18 @@ function shutdown() {
     "Shutting down..."
   );
 
-
   try {
     ffmpeg.kill(
       "SIGTERM"
     );
   } catch (e) {}
 
-
   try {
     server.close();
   } catch (e) {}
 
-
   process.exit(0);
-
 }
-
 
 process.on(
   "SIGINT",

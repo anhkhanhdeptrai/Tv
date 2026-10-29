@@ -7,43 +7,49 @@ const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const DEFAULT_URL =
+"https://amagi-live.ondemandkorea.com/amgplt0456.m3u8";
+
 const DELAY_SECONDS = Math.max(
 0,
-Number.parseInt(process.env.DELAY_SECONDS || "15", 10) || 0
+parseInt(process.env.DELAY_SECONDS || "15", 10) || 0
 );
-const SEGMENT_SECONDS = 2;
-const HLS_LIST_SIZE = 30;
-const sessions = new Map();
 
-const DEFAULT_URL = "https://dethich.pw/vtv3/index.m3u8";
+const SEGMENT_SECONDS = 4;
+const HLS_LIST_SIZE = 20;
+const MAX_FRAME_BYTES = 20 * 1024 * 1024;
+
+const sessions = new Map();
 
 function getSource(req) {
 const value = req.query.url || DEFAULT_URL;
 
 try {
-const parsed = new URL(value);
-if (!["http:", "https:"].includes(parsed.protocol)) return null;
-return parsed.href;
+const u = new URL(value);
+if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+return u.href;
 } catch {
 return null;
 }
 }
 
-function makeId(source) {
+function getId(source) {
 return crypto.createHash("sha256").update(source).digest("hex").slice(0, 16);
 }
 
-function startSession(source) {
-const id = makeId(source);
+function createSession(source) {
+const id = getId(source);
+
 if (sessions.has(id)) {
-sessions.get(id).lastAccess = Date.now();
-return sessions.get(id);
+const s = sessions.get(id);
+s.lastAccess = Date.now();
+return s;
 }
 
 const dir = path.join(os.tmpdir(), "tv-" + id);
 fs.mkdirSync(dir, { recursive: true });
 
-const session = {
+const s = {
 id,
 source,
 dir,
@@ -52,16 +58,15 @@ frames: [],
 frameBytes: 0,
 sequence: 0,
 jpegBuffer: Buffer.alloc(0),
-process: null,
+videoProcess: null,
+hlsProcess: null,
 error: null
 };
 
-sessions.set(id, session);
+sessions.set(id, s);
 
-const playlist = path.join(dir, "index.m3u8");
-const segment = path.join(dir, "seg_%06d.ts");
-
-const args = [
+// Process 1: create HLS with video and audio for the web.
+const hlsArgs = [
 "-hide_banner",
 "-loglevel", "warning",
 "-nostdin",
@@ -71,128 +76,171 @@ const args = [
 "-rw_timeout", "20000000",
 "-i", source,
 
-// MJPEG for ESP32-S3
-"-map", "0:v:0",
-"-an",
-"-vf", "fps=10,scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2",
-"-q:v", "8",
-"-f", "image2pipe",
-"-vcodec", "mjpeg",
-"pipe:1",
-
-// HLS with audio for the browser
 "-map", "0:v:0",
 "-map", "0:a:0?",
-"-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",
-"-c:v", "libx264",
-"-preset", "veryfast",
-"-pix_fmt", "yuv420p",
-"-g", "50",
-"-sc_threshold", "0",
+"-c:v", "copy",
 "-c:a", "aac",
 "-b:a", "96k",
+"-ac", "2",
 "-f", "hls",
 "-hls_time", String(SEGMENT_SECONDS),
 "-hls_list_size", String(HLS_LIST_SIZE),
-"-hls_flags", "delete_segments+append_list+independent_segments",
-"-hls_segment_filename", segment,
-playlist
+"-hls_delete_threshold", "10",
+"-hls_flags", "delete_segments+append_list",
+"-hls_segment_filename", path.join(dir, "seg_%06d.ts"),
+path.join(dir, "index.m3u8")
 
 ];
 
-console.log("Starting source:", source);
+console.log("Starting HLS with audio:", source);
 
-const child = spawn("ffmpeg", args, {
+const hls = spawn("ffmpeg", hlsArgs, {
+stdio: ["ignore", "ignore", "pipe"]
+});
+
+s.hlsProcess = hls;
+
+hls.stderr.on("data", d => {
+console.error("[HLS]", d.toString().trim());
+});
+
+hls.on("error", e => {
+s.error = e.message;
+console.error("[HLS spawn error]", e.message);
+});
+
+hls.on("close", code => {
+console.log("HLS FFmpeg exited:", code);
+if (code !== 0) s.error = "HLS FFmpeg exited with code " + code;
+});
+
+// Process 2: create MJPEG for the ESP32-S3.
+const mjpegArgs = [
+"-hide_banner",
+"-loglevel", "warning",
+"-nostdin",
+"-user_agent", "Mozilla/5.0 TV-Server/1.0",
+"-allowed_extensions", "ALL",
+"-allowed_segment_extensions", "ALL",
+"-rw_timeout", "20000000",
+"-i", source,
+"-map", "0:v:0",
+"-an",
+"-sn",
+"-dn",
+"-vf",
+"fps=8,scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2",
+"-q:v", "8",
+"-f", "image2pipe",
+"-vcodec", "mjpeg",
+"pipe:1"
+];
+
+console.log("Starting MJPEG:", source);
+
+const video = spawn("ffmpeg", mjpegArgs, {
 stdio: ["ignore", "pipe", "pipe"]
 });
 
-session.process = child;
+s.videoProcess = video;
 
-child.stdout.on("data", chunk => {
-session.jpegBuffer = Buffer.concat([session.jpegBuffer, chunk]);
+video.stdout.on("data", chunk => {
+s.jpegBuffer = Buffer.concat([s.jpegBuffer, chunk]);
 
 while (true) {
-  const start = session.jpegBuffer.indexOf(Buffer.from([255, 216]));
+  const start = s.jpegBuffer.indexOf(Buffer.from([0xff, 0xd8]));
+
   if (start < 0) {
-    session.jpegBuffer = session.jpegBuffer.slice(-1);
+    s.jpegBuffer = s.jpegBuffer.slice(-1);
     break;
   }
 
-  const end = session.jpegBuffer.indexOf(
-    Buffer.from([255, 217]),
+  const end = s.jpegBuffer.indexOf(
+    Buffer.from([0xff, 0xd9]),
     start + 2
   );
 
   if (end < 0) {
-    session.jpegBuffer = session.jpegBuffer.slice(start);
+    if (start > 0) s.jpegBuffer = s.jpegBuffer.slice(start);
     break;
   }
 
-  const jpeg = Buffer.from(session.jpegBuffer.subarray(start, end + 2));
-  session.jpegBuffer = session.jpegBuffer.subarray(end + 2);
+  const jpeg = Buffer.from(s.jpegBuffer.subarray(start, end + 2));
+  s.jpegBuffer = s.jpegBuffer.subarray(end + 2);
 
-  session.sequence++;
-  session.frames.push({
-    seq: session.sequence,
+  s.sequence++;
+  s.frames.push({
+    seq: s.sequence,
     time: Date.now(),
     data: jpeg
   });
-  session.frameBytes += jpeg.length;
+  s.frameBytes += jpeg.length;
 
   const cutoff = Date.now() - Math.max(30000, (DELAY_SECONDS + 15) * 1000);
 
   while (
-    session.frames.length &&
-    (session.frames[0].time < cutoff || session.frameBytes > 20 * 1024 * 1024)
+    s.frames.length &&
+    (s.frames[0].time < cutoff || s.frameBytes > MAX_FRAME_BYTES)
   ) {
-    const old = session.frames.shift();
-    session.frameBytes -= old.data.length;
+    const old = s.frames.shift();
+    s.frameBytes -= old.data.length;
+  }
+
+  if (s.sequence === 1) {
+    console.log("First MJPEG frame:", jpeg.length, "bytes");
   }
 }
 
 });
 
-child.stderr.on("data", data => {
-console.error("[ffmpeg]", data.toString().trim());
+video.stderr.on("data", d => {
+console.error("[MJPEG]", d.toString().trim());
 });
 
-child.on("error", error => {
-session.error = error.message;
-console.error("FFmpeg error:", error.message);
+video.on("error", e => {
+s.error = e.message;
+console.error("[MJPEG spawn error]", e.message);
 });
 
-child.on("close", code => {
-if (code !== 0) {
-session.error = "FFmpeg exited with code " + code;
-}
-console.log("FFmpeg stopped:", id, code);
+video.on("close", code => {
+console.log("MJPEG FFmpeg exited:", code);
 });
 
-return session;
+return s;
 }
 
-function getDelayedPlaylist(session) {
-const filename = path.join(session.dir, "index.m3u8");
-if (!fs.existsSync(filename)) return null;
+function delayedPlaylist(s) {
+const file = path.join(s.dir, "index.m3u8");
+if (!fs.existsSync(file)) return null;
 
-const text = fs.readFileSync(filename, "utf8");
-const lines = text.split(/\r?\n/).filter(Boolean);
-const indexes = [];
+let lines;
+
+try {
+lines = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+} catch {
+return null;
+}
+
+const segmentLineIndexes = [];
 
 for (let i = 0; i < lines.length; i++) {
-if (!lines[i].startsWith("#")) indexes.push(i);
+if (!lines[i].startsWith("#")) segmentLineIndexes.push(i);
 }
 
-const delaySegments = Math.ceil(DELAY_SECONDS / SEGMENT_SECONDS);
+const delayCount = Math.ceil(DELAY_SECONDS / SEGMENT_SECONDS);
 
-if (indexes.length > delaySegments + 2) {
-const keep = indexes.length - delaySegments;
-lines.splice(indexes[keep - 1] + 1);
+// Hide the newest segments to introduce a playback delay.
+if (delayCount > 0 && segmentLineIndexes.length > delayCount + 2) {
+const keepCount = segmentLineIndexes.length - delayCount;
+lines = lines.slice(0, segmentLineIndexes[keepCount - 1] + 1);
 }
 
 return lines.map(line => {
 if (line.startsWith("#")) return line;
-return "/hls-segment/" + session.id + "/" + encodeURIComponent(path.basename(line));
+
+const filename = path.basename(line);
+return "/hls-segment/" + s.id + "/" + encodeURIComponent(filename);
+
 }).join("\n") + "\n";
 }
 
@@ -200,12 +248,13 @@ app.get("/health", (req, res) => {
 res.json({
 ok: true,
 delaySeconds: DELAY_SECONDS,
-activeSessions: sessions.size
+sessions: sessions.size
 });
 });
 
 app.get("/", (req, res) => {
 const source = getSource(req) || DEFAULT_URL;
+const safeSource = source.replace(/&/g, "&").replace(/"/g, """);
 
 res.type("html").send(`<!doctype html>
 
@@ -215,7 +264,7 @@ res.type("html").send(`<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TV Online</title>
 <style>
-body{background:#111;color:#eee;font-family:Arial;text-align:center;margin:0}
+body{background:#111;color:#eee;font-family:Arial,sans-serif;text-align:center;margin:0}
 main{max-width:800px;margin:auto;padding:16px}
 video{width:100%;background:#000}
 input{box-sizing:border-box;width:100%;padding:12px}
@@ -226,23 +275,24 @@ button{padding:12px;margin:8px}
 <main>
 <h2>TV Online</h2>
 <form id="form">
-<input id="url" value="${source.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">
+<input id="url" value="${safeSource}">
 <button type="submit">Mở kênh</button>
 </form>
 <video id="video" controls playsinline></video>
-<p id="status">Nhấn Play để xem và nghe TV.</p>
-<p>Độ trễ cấu hình: ${DELAY_SECONDS} giây</p>
+<p id="status">Đang tải playlist...</p>
+<p>Độ trễ mục tiêu: ${DELAY_SECONDS} giây</p>
 <p><a style="color:#8cf" href="/stream?url=${encodeURIComponent(source)}">Luồng MJPEG cho ESP32</a></p>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 const video = document.getElementById("video");
 const input = document.getElementById("url");
-const status = document.getElementById("status");
+const statusText = document.getElementById("status");
 let player = null;function startTV() {
 const source = input.value.trim();
-if (!/^https?:\/\//i.test(source)) {
-status.textContent = "URL không hợp lệ";
+
+if (!(source.startsWith("https://") || source.startsWith("http://"))) {
+statusText.textContent = "URL không hợp lệ";
 return;
 }
 
@@ -251,30 +301,41 @@ player.destroy();
 player = null;
 }
 
-const url = "/hls?url=" + encodeURIComponent(source);
+video.pause();
+video.removeAttribute("src");
+video.load();
+
+const playlist = "/hls?url=" + encodeURIComponent(source);
 
 if (window.Hls && Hls.isSupported()) {
 player = new Hls({
 lowLatencyMode: false,
 liveSyncDurationCount: 8,
-maxBufferLength: 30
+maxBufferLength: 30,
+backBufferLength: 30
 });
 
-player.loadSource(url);
+player.loadSource(playlist);
 player.attachMedia(video);
-player.on(Hls.Events.MANIFEST_PARSED, function() {
-  status.textContent = "Đã tải luồng. Nhấn Play để nghe tiếng.";
-});
-player.on(Hls.Events.ERROR, function(event, data) {
-  if (data.fatal) status.textContent = "Lỗi HLS: " + data.details;
+
+player.on(Hls.Events.MANIFEST_PARSED, () => {
+  statusText.textContent = "Đã tải luồng. Nhấn Play để nghe tiếng.";
 });
 
+player.on(Hls.Events.ERROR, (event, data) => {
+  if (data.fatal) {
+    statusText.textContent = "Lỗi HLS: " + data.details;
+  }
+});
+
+} else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+video.src = playlist;
 } else {
-video.src = url;
+statusText.textContent = "Trình duyệt không hỗ trợ HLS.";
 }
 }
 
-document.getElementById("form").addEventListener("submit", function(event) {
+document.getElementById("form").addEventListener("submit", event => {
 event.preventDefault();
 startTV();
 });
@@ -286,36 +347,40 @@ startTV();
 </html>`);
 });app.get("/hls", (req, res) => {
 const source = getSource(req);
-if (!source) return res.status(400).send("Invalid URL");
+if (!source) return res.status(400).send("Invalid stream URL");
 
-const session = startSession(source);
-session.lastAccess = Date.now();
+const s = createSession(source);
+s.lastAccess = Date.now();
 
-const playlist = getDelayedPlaylist(session);
-res.setHeader("Access-Control-Allow-Origin", "*");
+const playlist = delayedPlaylist(s);
+
 res.setHeader("Cache-Control", "no-cache, no-store");
+res.setHeader("Access-Control-Allow-Origin", "*");
 
 if (!playlist) {
 res.setHeader("Retry-After", "2");
-return res.status(503).send(session.error || "Waiting for HLS playlist...");
+return res.status(503).type("text").send(
+s.error || "Đang chờ FFmpeg tạo playlist..."
+);
 }
 
 res.type("application/vnd.apple.mpegurl").send(playlist);
 });
 
 app.get("/hls-segment/:id/:file", (req, res) => {
-const session = sessions.get(req.params.id);
-if (!session) return res.status(404).send("Session not found");
+const s = sessions.get(req.params.id);
+if (!s) return res.status(404).send("Session not found");
 
 const filename = path.basename(req.params.file);
+
 if (!/^seg_[0-9]+.ts$/.test(filename)) {
-return res.status(400).send("Invalid segment");
+return res.status(400).send("Invalid segment name");
 }
 
-const file = path.join(session.dir, filename);
+const file = path.join(s.dir, filename);
 if (!fs.existsSync(file)) return res.status(404).send("Segment not ready");
 
-session.lastAccess = Date.now();
+s.lastAccess = Date.now();
 res.setHeader("Content-Type", "video/mp2t");
 res.setHeader("Cache-Control", "public, max-age=1");
 res.sendFile(file);
@@ -323,18 +388,19 @@ res.sendFile(file);
 
 app.get("/stream", (req, res) => {
 const source = getSource(req);
-if (!source) return res.status(400).send("Invalid URL");
+if (!source) return res.status(400).send("Invalid stream URL");
 
-const session = startSession(source);
-session.lastAccess = Date.now();
+const s = createSession(source);
+s.lastAccess = Date.now();
 
 res.writeHead(200, {
 "Content-Type": "multipart/x-mixed-replace; boundary=frame",
 "Cache-Control": "no-cache, no-store",
-"Access-Control-Allow-Origin": "*"
+"Access-Control-Allow-Origin": "*",
+"Connection": "keep-alive"
 });
 
-let lastSequence = -1;
+let lastSeq = -1;
 
 const timer = setInterval(() => {
 if (res.destroyed || res.writableEnded) {
@@ -342,20 +408,20 @@ clearInterval(timer);
 return;
 }
 
-const target = Date.now() - DELAY_SECONDS * 1000;
+const targetTime = Date.now() - DELAY_SECONDS * 1000;
 let selected = null;
 
-for (let i = session.frames.length - 1; i >= 0; i--) {
-  if (session.frames[i].time <= target) {
-    selected = session.frames[i];
+for (let i = s.frames.length - 1; i >= 0; i--) {
+  if (s.frames[i].time <= targetTime) {
+    selected = s.frames[i];
     break;
   }
 }
 
-if (!selected || selected.seq <= lastSequence) return;
+if (!selected || selected.seq <= lastSeq) return;
 
-lastSequence = selected.seq;
-session.lastAccess = Date.now();
+lastSeq = selected.seq;
+s.lastAccess = Date.now();
 
 res.write("--frame\r\n");
 res.write("Content-Type: image/jpeg\r\n");
@@ -371,17 +437,17 @@ res.on("close", () => clearInterval(timer));
 setInterval(() => {
 const now = Date.now();
 
-for (const [id, session] of sessions.entries()) {
-if (now - session.lastAccess < 5 * 60 * 1000) continue;
+for (const [id, s] of sessions.entries()) {
+if (now - s.lastAccess < 5 * 60 * 1000) continue;
 
-if (session.process && session.process.exitCode === null) {
-  session.process.kill("SIGTERM");
+for (const child of [s.videoProcess, s.hlsProcess]) {
+  if (child && child.exitCode === null) child.kill("SIGTERM");
 }
 
 try {
-  fs.rmSync(session.dir, { recursive: true, force: true });
-} catch (error) {
-  console.error("Cleanup error:", error.message);
+  fs.rmSync(s.dir, { recursive: true, force: true });
+} catch (e) {
+  console.error("Cleanup error:", e.message);
 }
 
 sessions.delete(id);
@@ -391,5 +457,6 @@ sessions.delete(id);
 
 app.listen(PORT, "0.0.0.0", () => {
 console.log("TV server listening on port", PORT);
+console.log("Default stream:", DEFAULT_URL);
 console.log("Delay:", DELAY_SECONDS, "seconds");
 });

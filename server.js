@@ -3,12 +3,13 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const http = require("http");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 // =====================================================
-// IPTV-ORG VIETNAM PLAYLIST
+// IPTV-ORG
 // =====================================================
 
 const M3U_URL =
@@ -32,6 +33,14 @@ const MAX_BUFFER_FRAMES =
 const HLS_TIME = 2;
 const HLS_LIST = 8;
 
+// kiểm tra stream
+const CHECK_TIMEOUT = 7000;
+const CHECK_CONCURRENCY = 6;
+
+// =====================================================
+// HLS
+// =====================================================
+
 const HLS_DIR =
   path.join(__dirname, "hls");
 
@@ -49,52 +58,70 @@ function downloadM3U(url) {
 
   return new Promise((resolve, reject) => {
 
-    https.get(
-      url,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0"
-        }
-      },
-      response => {
+    const protocol =
+      url.startsWith("https")
+        ? https
+        : http;
 
-        let data = "";
-
-        response.setEncoding("utf8");
-
-        response.on(
-          "data",
-          chunk => {
-            data += chunk;
+    const request =
+      protocol.get(
+        url,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0"
           }
-        );
+        },
+        response => {
 
-        response.on(
-          "end",
-          () => {
+          let data = "";
 
-            if (
-              response.statusCode < 200 ||
-              response.statusCode >= 300
-            ) {
+          response.setEncoding("utf8");
 
-              reject(
-                new Error(
-                  "HTTP " +
-                  response.statusCode
-                )
-              );
-
-              return;
+          response.on(
+            "data",
+            chunk => {
+              data += chunk;
             }
+          );
 
-            resolve(data);
-          }
+          response.on(
+            "end",
+            () => {
+
+              if (
+                response.statusCode < 200 ||
+                response.statusCode >= 300
+              ) {
+
+                reject(
+                  new Error(
+                    "M3U HTTP " +
+                    response.statusCode
+                  )
+                );
+
+                return;
+              }
+
+              resolve(data);
+            }
+          );
+        }
+      );
+
+    request.setTimeout(
+      CHECK_TIMEOUT,
+      () => {
+        request.destroy(
+          new Error(
+            "M3U timeout"
+          )
         );
-
       }
-    ).on(
+    );
+
+    request.on(
       "error",
       reject
     );
@@ -143,6 +170,13 @@ function parseM3U(text) {
         ) || []
       )[1] || "";
 
+    const tvgName =
+      (
+        line.match(
+          /tvg-name="([^"]*)"/i
+        ) || []
+      )[1] || "";
+
     const logo =
       (
         line.match(
@@ -175,13 +209,36 @@ function parseM3U(text) {
       }
     }
 
-    if (!url) continue;
+    if (!url) {
+      continue;
+    }
 
     if (!name) {
       name =
+        tvgName ||
         tvgId ||
-        "Channel " +
-        result.length;
+        `Channel ${result.length + 1}`;
+    }
+
+    // =============================================
+    // Bỏ các kênh đã được đánh dấu Geo-blocked
+    // =============================================
+
+    if (
+      line.includes("[Geo-blocked]") ||
+      name.includes("[Geo-blocked]")
+    ) {
+      continue;
+    }
+
+    // =============================================
+    // Bỏ DRM / DASH
+    // =============================================
+
+    if (
+      url.includes(".mpd")
+    ) {
+      continue;
     }
 
     result.push({
@@ -197,11 +254,393 @@ function parseM3U(text) {
 
       group,
 
-      url
+      url,
+
+      checking: true,
+
+      available: false,
+
+      error: null
     });
   }
 
   return result;
+}
+
+// =====================================================
+// CHECK ONE STREAM
+// =====================================================
+//
+// Không dùng FFmpeg ở bước này.
+// Chỉ request URL để phát hiện:
+// 403 / 401 / 404 / timeout / connection error.
+//
+// =====================================================
+
+function checkStream(url) {
+
+  return new Promise(resolve => {
+
+    let finished = false;
+
+    function done(result) {
+
+      if (finished) return;
+
+      finished = true;
+
+      resolve(result);
+    }
+
+    let parsed;
+
+    try {
+
+      parsed =
+        new URL(url);
+
+    } catch {
+
+      done({
+        ok: false,
+        status: 0,
+        error: "Invalid URL"
+      });
+
+      return;
+    }
+
+    const protocol =
+      parsed.protocol === "https:"
+        ? https
+        : http;
+
+    const request =
+      protocol.get(
+        parsed,
+        {
+          headers: {
+
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+
+            "Accept":
+              "*/*",
+
+            "Accept-Language":
+              "en-US,en;q=0.9",
+
+            "Connection":
+              "close",
+
+            "Range":
+              "bytes=0-2047"
+          }
+        },
+        response => {
+
+          const status =
+            response.statusCode || 0;
+
+          // =====================================
+          // CHẮC CHẮN LỖI
+          // =====================================
+
+          if (
+            status === 401 ||
+            status === 403 ||
+            status === 404 ||
+            status === 410
+          ) {
+
+            response.destroy();
+
+            done({
+              ok: false,
+              status,
+              error:
+                `HTTP ${status}`
+            });
+
+            return;
+          }
+
+          // =====================================
+          // 5xx
+          // =====================================
+
+          if (
+            status >= 500
+          ) {
+
+            response.destroy();
+
+            done({
+              ok: false,
+              status,
+              error:
+                `HTTP ${status}`
+            });
+
+            return;
+          }
+
+          // =====================================
+          // Redirect đã được xử lý?
+          //
+          // Node https.get không tự follow redirect.
+          // Nếu gặp redirect thì coi là có thể truy cập,
+          // nhưng URL sẽ được kiểm tra lại ở FFmpeg.
+          // =====================================
+
+          if (
+            status >= 300 &&
+            status < 400
+          ) {
+
+            response.destroy();
+
+            done({
+              ok: true,
+              status,
+              error: null
+            });
+
+            return;
+          }
+
+          // =====================================
+          // 200 / 206
+          // =====================================
+
+          if (
+            status === 200 ||
+            status === 206
+          ) {
+
+            let received = 0;
+
+            response.on(
+              "data",
+              chunk => {
+
+                received +=
+                  chunk.length;
+
+                if (
+                  received >
+                  2048
+                ) {
+                  response.destroy();
+
+                  done({
+                    ok: true,
+                    status,
+                    error: null
+                  });
+                }
+              }
+            );
+
+            response.on(
+              "end",
+              () => {
+
+                done({
+                  ok: true,
+                  status,
+                  error: null
+                });
+              }
+            );
+
+            response.on(
+              "close",
+              () => {
+
+                done({
+                  ok: true,
+                  status,
+                  error: null
+                });
+              }
+            );
+
+            return;
+          }
+
+          response.destroy();
+
+          done({
+            ok: false,
+            status,
+            error:
+              `HTTP ${status}`
+          });
+        }
+      );
+
+    request.setTimeout(
+      CHECK_TIMEOUT,
+      () => {
+
+        request.destroy();
+
+        done({
+          ok: false,
+          status: 0,
+          error: "TIMEOUT"
+        });
+      }
+    );
+
+    request.on(
+      "error",
+      error => {
+
+        done({
+          ok: false,
+          status: 0,
+          error:
+            error.message
+        });
+    });
+  });
+}
+
+// =====================================================
+// CHECK ALL CHANNELS
+// =====================================================
+
+async function checkChannels(list) {
+
+  console.log("");
+  console.log(
+    "======================================"
+  );
+
+  console.log(
+    "KIỂM TRA STREAM"
+  );
+
+  console.log(
+    "Tổng:",
+    list.length
+  );
+
+  console.log(
+    "======================================"
+  );
+
+  let index = 0;
+
+  const valid = [];
+
+  async function worker() {
+
+    while (true) {
+
+      const i =
+        index++;
+
+      if (
+        i >= list.length
+      ) {
+        return;
+      }
+
+      const channel =
+        list[i];
+
+      console.log(
+        `[${i + 1}/${list.length}]`,
+        channel.name
+      );
+
+      const result =
+        await checkStream(
+          channel.url
+        );
+
+      if (result.ok) {
+
+        channel.available =
+          true;
+
+        channel.checking =
+          false;
+
+        valid.push(channel);
+
+        console.log(
+          "  ✓ OK",
+          result.status
+        );
+
+      } else {
+
+        channel.available =
+          false;
+
+        channel.checking =
+          false;
+
+        channel.error =
+          result.error;
+
+        console.log(
+          "  ✗ BỎ",
+          result.error
+        );
+      }
+    }
+  }
+
+  const workers = [];
+
+  for (
+    let i = 0;
+    i < CHECK_CONCURRENCY;
+    i++
+  ) {
+
+    workers.push(
+      worker()
+    );
+  }
+
+  await Promise.all(
+    workers
+  );
+
+  // đánh lại ID
+  valid.forEach(
+    (channel, i) => {
+      channel.id =
+        String(i);
+    }
+  );
+
+  console.log("");
+  console.log(
+    "======================================"
+  );
+
+  console.log(
+    "KÊNH HỢP LỆ:",
+    valid.length
+  );
+
+  console.log(
+    "KÊNH BỊ LOẠI:",
+    list.length - valid.length
+  );
+
+  console.log(
+    "======================================"
+  );
+
+  return valid;
 }
 
 // =====================================================
@@ -291,17 +730,20 @@ function startFFmpeg(channel) {
 
   console.log("");
   console.log(
-    "================================"
+    "======================================"
   );
+
   console.log(
     "ĐANG PHÁT:",
     channel.name
   );
+
   console.log(
     channel.url
   );
+
   console.log(
-    "================================"
+    "======================================"
   );
 
   stopFFmpeg();
@@ -334,10 +776,6 @@ function startFFmpeg(channel) {
       "-loglevel",
       "warning",
 
-      // =========================
-      // NETWORK
-      // =========================
-
       "-reconnect",
       "1",
 
@@ -350,16 +788,12 @@ function startFFmpeg(channel) {
       "-fflags",
       "nobuffer",
 
-      // =========================
-      // INPUT
-      // =========================
-
       "-i",
       channel.url,
 
-      // =================================================
-      // OUTPUT 1 — HLS
-      // =================================================
+      // =========================================
+      // HLS
+      // =========================================
 
       "-map",
       "0:v:0",
@@ -396,9 +830,9 @@ function startFFmpeg(channel) {
 
       playlist,
 
-      // =================================================
-      // OUTPUT 2 — MJPEG
-      // =================================================
+      // =========================================
+      // MJPEG
+      // =========================================
 
       "-map",
       "0:v:0",
@@ -406,7 +840,6 @@ function startFFmpeg(channel) {
       "-an",
 
       "-vf",
-
       `fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
 
       "-c:v",
@@ -425,9 +858,9 @@ function startFFmpeg(channel) {
     ]
   );
 
-  // ===================================================
+  // =========================================
   // STDERR
-  // ===================================================
+  // =========================================
 
   ffmpeg.stderr.on(
     "data",
@@ -448,9 +881,9 @@ function startFFmpeg(channel) {
     }
   );
 
-  // ===================================================
+  // =========================================
   // MJPEG
-  // ===================================================
+  // =========================================
 
   ffmpeg.stdout.on(
     "data",
@@ -563,9 +996,9 @@ function startFFmpeg(channel) {
     }
   );
 
-  // ===================================================
+  // =========================================
   // CLOSE
-  // ===================================================
+  // =========================================
 
   ffmpeg.on(
     "close",
@@ -607,7 +1040,7 @@ function startFFmpeg(channel) {
 }
 
 // =====================================================
-// API — CHANNELS
+// API CHANNELS
 // =====================================================
 
 app.get(
@@ -625,22 +1058,28 @@ app.get(
           : null,
 
       channels:
-        channels.map(ch => ({
+        channels.map(
+          ch => ({
 
-          id: ch.id,
+            id:
+              ch.id,
 
-          name: ch.name,
+            name:
+              ch.name,
 
-          group: ch.group,
+            group:
+              ch.group,
 
-          logo: ch.logo
-        }))
+            logo:
+              ch.logo
+          })
+        )
     });
   }
 );
 
 // =====================================================
-// API — SELECT CHANNEL
+// SELECT
 // =====================================================
 
 app.get(
@@ -651,7 +1090,9 @@ app.get(
       channels.find(
         ch =>
           ch.id ===
-          String(req.params.id)
+          String(
+            req.params.id
+          )
       );
 
     if (!channel) {
@@ -797,7 +1238,7 @@ app.get(
 );
 
 // =====================================================
-// MJPEG — ESP32
+// MJPEG
 // =====================================================
 
 app.get(
@@ -853,11 +1294,7 @@ app.get(
         () => {
 
           if (closed) {
-
-            clearInterval(
-              timer
-            );
-
+            clearInterval(timer);
             return;
           }
 
@@ -869,8 +1306,7 @@ app.get(
 
           const target =
             Date.now() -
-            DELAY_SECONDS *
-              1000;
+            DELAY_SECONDS * 1000;
 
           let selected = null;
 
@@ -894,7 +1330,6 @@ app.get(
           }
 
           if (!selected) {
-
             selected =
               frames[0];
           }
@@ -937,9 +1372,7 @@ app.get(
 
             closed = true;
 
-            clearInterval(
-              timer
-            );
+            clearInterval(timer);
           }
 
         },
@@ -960,7 +1393,7 @@ app.get(
 
       status: "ok",
 
-      source:
+      playlist:
         M3U_URL,
 
       channelCount:
@@ -977,40 +1410,16 @@ app.get(
           : null,
 
       mjpeg: {
-
         url: "/stream",
-
-        width:
-          WIDTH,
-
-        height:
-          HEIGHT,
-
-        fps:
-          FPS,
-
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS,
         delaySeconds:
           DELAY_SECONDS,
-
         bufferSeconds:
           BUFFER_SECONDS,
-
         currentFrames:
           frames.length
-      },
-
-      hls: {
-
-        playlist:
-          "/hls/stream.m3u8",
-
-        ready:
-          fs.existsSync(
-            path.join(
-              HLS_DIR,
-              "stream.m3u8"
-            )
-          )
       }
     });
   }
@@ -1048,7 +1457,7 @@ app.get(
 
 <meta
 name="viewport"
-content="width=device-width, initial-scale=1"
+content="width=device-width,initial-scale=1"
 >
 
 <title>Vietnam TV</title>
@@ -1070,7 +1479,7 @@ body {
 
 video {
   width:100%;
-  background:black;
+  background:#000;
 }
 
 .search {
@@ -1080,7 +1489,7 @@ video {
   margin:15px 0;
   background:#222;
   border:1px solid #444;
-  color:white;
+  color:#fff;
   border-radius:6px;
 }
 
@@ -1103,12 +1512,18 @@ video {
 .info {
   color:#aaa;
   font-size:14px;
+  margin:8px 0;
 }
 
 .mjpeg {
   width:320px;
   height:240px;
-  background:black;
+  background:#000;
+}
+
+#status {
+  margin:10px 0;
+  color:#4caf50;
 }
 
 </style>
@@ -1122,7 +1537,7 @@ video {
 <h2>🇻🇳 Vietnam TV</h2>
 
 <div id="status">
-Đang tải danh sách...
+Đang kiểm tra các kênh...
 </div>
 
 <video
@@ -1132,7 +1547,7 @@ autoplay
 playsinline
 ></video>
 
-<h3>Danh sách kênh</h3>
+<h3>Danh sách kênh khả dụng</h3>
 
 <input
 id="search"
@@ -1147,8 +1562,6 @@ placeholder="🔎 Tìm VTV, HTV, SCTV..."
 <div class="info">
 320 × 240 — 14 FPS — delay khoảng 10 giây
 </div>
-
-<br>
 
 <img
 src="/stream"
@@ -1193,48 +1606,56 @@ let current = null;
 let hls = null;
 
 
-// ==========================================
+// =========================================
 // LOAD
-// ==========================================
+// =========================================
 
 async function loadChannels() {
 
-  const r =
-    await fetch(
-      "/api/channels"
-    );
+  try {
 
-  const data =
-    await r.json();
+    const r =
+      await fetch(
+        "/api/channels"
+      );
 
-  channels =
-    data.channels;
+    const data =
+      await r.json();
 
-  current =
-    data.current;
+    channels =
+      data.channels;
 
-  renderChannels();
+    current =
+      data.current;
 
-  const ch =
-    channels.find(
-      c => c.id === current
-    );
+    renderChannels();
 
-  status.innerText =
-    "Đang phát: " +
-    (
-      ch
-        ? ch.name
-        : ""
-    );
+    const ch =
+      channels.find(
+        c => c.id === current
+      );
 
-  startHLS();
+    status.innerText =
+      "Đang phát: " +
+      (
+        ch
+          ? ch.name
+          : ""
+      );
+
+    startHLS();
+
+  } catch {
+
+    status.innerText =
+      "Không tải được danh sách";
+  }
 }
 
 
-// ==========================================
+// =========================================
 // HLS
-// ==========================================
+// =========================================
 
 function startHLS() {
 
@@ -1254,8 +1675,7 @@ function startHLS() {
   }
 
   if (
-    typeof Hls !==
-      "undefined" &&
+    typeof Hls !== "undefined" &&
     Hls.isSupported()
   ) {
 
@@ -1290,9 +1710,9 @@ function startHLS() {
 }
 
 
-// ==========================================
-// RENDER CHANNELS
-// ==========================================
+// =========================================
+// RENDER
+// =========================================
 
 function renderChannels() {
 
@@ -1344,9 +1764,9 @@ function renderChannels() {
 }
 
 
-// ==========================================
+// =========================================
 // SELECT
-// ==========================================
+// =========================================
 
 async function selectChannel(
   id,
@@ -1382,7 +1802,8 @@ async function selectChannel(
       "Đang phát: " +
       name;
 
-    // Cho FFmpeg tạo playlist
+    // FFmpeg cần thời gian
+    // tạo playlist mới
     setTimeout(
       startHLS,
       1500
@@ -1391,14 +1812,14 @@ async function selectChannel(
   } catch {
 
     status.innerText =
-      "Không thể phát kênh này";
+      "Kênh này không thể phát";
   }
 }
 
 
-// ==========================================
+// =========================================
 // SEARCH
-// ==========================================
+// =========================================
 
 search.addEventListener(
   "input",
@@ -1406,9 +1827,9 @@ search.addEventListener(
 );
 
 
-// ==========================================
+// =========================================
 // START
-// ==========================================
+// =========================================
 
 loadChannels();
 
@@ -1423,7 +1844,7 @@ loadChannels();
 );
 
 // =====================================================
-// START SERVER
+// START
 // =====================================================
 
 app.listen(
@@ -1431,26 +1852,23 @@ app.listen(
   "0.0.0.0",
   async () => {
 
+    console.log("");
     console.log(
-      "================================"
+      "======================================"
     );
 
     console.log(
-      "TV SERVER STARTING"
+      "VIETNAM TV SERVER"
     );
 
     console.log(
-      "================================"
+      "======================================"
     );
 
     try {
 
       console.log(
-        "Đang tải playlist:"
-      );
-
-      console.log(
-        M3U_URL
+        "Đang tải vn.m3u..."
       );
 
       const m3u =
@@ -1458,25 +1876,39 @@ app.listen(
           M3U_URL
         );
 
-      channels =
+      const allChannels =
         parseM3U(m3u);
 
       console.log(
-        "Đã tải:",
-        channels.length,
+        "Tìm thấy:",
+        allChannels.length,
         "kênh"
       );
+
+      // =========================================
+      // KIỂM TRA URL
+      // =========================================
+
+      channels =
+        await checkChannels(
+          allChannels
+        );
 
       if (
         channels.length === 0
       ) {
 
-        throw new Error(
-          "Playlist không có kênh"
+        console.error(
+          "Không có kênh khả dụng!"
         );
+
+        process.exit(1);
       }
 
-      // Chọn kênh đầu tiên
+      // =========================================
+      // KÊNH ĐẦU TIÊN
+      // =========================================
+
       currentChannel =
         channels[0];
 
@@ -1484,18 +1916,25 @@ app.listen(
         currentChannel
       );
 
+      console.log("");
+      console.log(
+        "Server:",
+        `http://0.0.0.0:${PORT}`
+      );
+
+      console.log(
+        "Kênh khả dụng:",
+        channels.length
+      );
+
     } catch (error) {
 
       console.error(
-        "Không tải được M3U:",
+        "LỖI:",
         error.message
       );
 
       process.exit(1);
     }
-
-    console.log(
-      `Server chạy port ${PORT}`
-    );
   }
 );

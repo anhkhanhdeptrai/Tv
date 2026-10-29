@@ -1,0 +1,9 @@
+{
+  "name": "esp32-tv-mjpeg-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Convert online TV streams to 320x240 MJPEG for ESP32-S3",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}

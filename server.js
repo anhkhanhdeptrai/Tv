@@ -7,15 +7,9 @@ const app = express();
 
 const PORT = process.env.PORT || 10000;
 
-// ======================================================
-// SOURCE
-// ======================================================
-
-const DEFAULT_URL =
-  "https://amagi-live.ondemandkorea.com/amgplt0456.m3u8";
-
 const source =
-  process.env.STREAM_URL || DEFAULT_URL;
+  process.env.STREAM_URL ||
+  "https://amagi-live.ondemandkorea.com/amgplt0456.m3u8";
 
 // ======================================================
 // CONFIG
@@ -23,15 +17,15 @@ const source =
 
 const DELAY_SECONDS = 15;
 
-const MJPEG_FPS = 10;
 const MJPEG_WIDTH = 320;
 const MJPEG_HEIGHT = 240;
+const MJPEG_FPS = 10;
 
 const HLS_SEGMENT_SECONDS = 4;
 const HLS_LIST_SIZE = 20;
 
 // ======================================================
-// DIRECTORIES
+// PATH
 // ======================================================
 
 const DATA_DIR = path.join(__dirname, "data");
@@ -49,7 +43,7 @@ let ffmpegProcess = null;
 
 let frameBuffer = [];
 
-const MAX_FRAME_BUFFER = 30;
+const MAX_FRAME_BUFFER = 25;
 
 let totalFrames = 0;
 
@@ -70,12 +64,9 @@ function log(...args) {
 
 function cleanHLS() {
   try {
-    if (!fs.existsSync(HLS_DIR)) {
-      fs.mkdirSync(HLS_DIR, {
-        recursive: true
-      });
-      return;
-    }
+    fs.mkdirSync(HLS_DIR, {
+      recursive: true
+    });
 
     for (const file of fs.readdirSync(HLS_DIR)) {
       try {
@@ -86,7 +77,7 @@ function cleanHLS() {
     }
   } catch (err) {
     console.error(
-      "HLS cleanup:",
+      "[HLS CLEAN]",
       err.message
     );
   }
@@ -104,25 +95,15 @@ function startFFmpeg() {
 
   cleanHLS();
 
-  log("Starting FFmpeg");
-  log("Source:", source);
-
-  /*
-   * Một FFmpeg đọc source duy nhất.
-   *
-   * Output 1:
-   *   MJPEG 320x240 10 FPS -> pipe:1
-   *
-   * Output 2:
-   *   HLS H264 + AAC -> data/hls
-   */
+  log("[FFMPEG] Starting");
+  log("[FFMPEG] Source:", source);
 
   const args = [
 
     "-hide_banner",
 
     // --------------------------------------------------
-    // reconnect
+    // NETWORK
     // --------------------------------------------------
 
     "-reconnect",
@@ -134,7 +115,6 @@ function startFFmpeg() {
     "-reconnect_delay_max",
     "5",
 
-    // Cho phép HLS dùng extension lạ
     "-allowed_extensions",
     "ALL",
 
@@ -150,7 +130,7 @@ function startFFmpeg() {
 
     // ==================================================
     // OUTPUT 1
-    // MJPEG -> ESP32
+    // MJPEG
     // ==================================================
 
     "-map",
@@ -167,27 +147,27 @@ function startFFmpeg() {
     "-fps_mode",
     "cfr",
 
-    "-threads",
-    "1",
-
     "-f",
     "image2pipe",
 
-    "-vcodec",
+    "-c:v",
     "mjpeg",
 
     "pipe:1",
 
     // ==================================================
     // OUTPUT 2
-    // HLS VIDEO + AUDIO
+    // HLS
     // ==================================================
 
     "-map",
     "0:v:0",
 
+    // Audio OPTIONAL
+    // Nếu nguồn có audio -> lấy audio
+    // Nếu không có -> FFmpeg vẫn chạy
     "-map",
-    "0:a:0",
+    "0:a:0?",
 
     // Video
     "-c:v",
@@ -271,24 +251,26 @@ function startFFmpeg() {
   );
 
   // ==================================================
-  // STDOUT
+  // MJPEG PIPE
   // ==================================================
 
-  let pipeBuffer = Buffer.alloc(0);
+  let jpegBuffer =
+    Buffer.alloc(0);
 
   ffmpegProcess.stdout.on(
     "data",
     (chunk) => {
 
-      pipeBuffer = Buffer.concat([
-        pipeBuffer,
-        chunk
-      ]);
+      jpegBuffer =
+        Buffer.concat([
+          jpegBuffer,
+          chunk
+        ]);
 
       while (true) {
 
         const start =
-          pipeBuffer.indexOf(
+          jpegBuffer.indexOf(
             Buffer.from([
               0xff,
               0xd8
@@ -300,7 +282,7 @@ function startFFmpeg() {
         }
 
         const end =
-          pipeBuffer.indexOf(
+          jpegBuffer.indexOf(
             Buffer.from([
               0xff,
               0xd9
@@ -313,13 +295,13 @@ function startFFmpeg() {
         }
 
         const jpeg =
-          pipeBuffer.slice(
+          jpegBuffer.slice(
             start,
             end + 2
           );
 
-        pipeBuffer =
-          pipeBuffer.slice(
+        jpegBuffer =
+          jpegBuffer.slice(
             end + 2
           );
 
@@ -330,7 +312,7 @@ function startFFmpeg() {
           data: jpeg
         });
 
-        // Chỉ giữ buffer nhỏ
+        // Không giữ quá nhiều frame
         while (
           frameBuffer.length >
           MAX_FRAME_BUFFER
@@ -342,7 +324,7 @@ function startFFmpeg() {
   );
 
   // ==================================================
-  // STDERR
+  // FFMPEG LOG
   // ==================================================
 
   ffmpegProcess.stderr.on(
@@ -355,10 +337,6 @@ function startFFmpeg() {
     }
   );
 
-  // ==================================================
-  // ERROR
-  // ==================================================
-
   ffmpegProcess.on(
     "error",
     (err) => {
@@ -370,16 +348,12 @@ function startFFmpeg() {
     }
   );
 
-  // ==================================================
-  // CLOSE
-  // ==================================================
-
   ffmpegProcess.on(
     "close",
     (code, signal) => {
 
       log(
-        `FFmpeg exited code=${code} signal=${signal}`
+        `[FFMPEG] exited code=${code} signal=${signal}`
       );
 
       ffmpegProcess = null;
@@ -396,69 +370,116 @@ function startFFmpeg() {
 // HLS PLAYLIST
 // ======================================================
 
-function getDelayedPlaylist() {
+function getPlaylist() {
 
-  const playlistPath =
+  const file =
     path.join(
       HLS_DIR,
       "index.m3u8"
     );
 
-  if (
-    !fs.existsSync(
-      playlistPath
-    )
-  ) {
+  if (!fs.existsSync(file)) {
     return null;
   }
 
-  const playlist =
+  let playlist =
     fs.readFileSync(
-      playlistPath,
+      file,
+      "utf8"
+    );
+
+  /*
+   * QUAN TRỌNG:
+   *
+   * FFmpeg ghi:
+   *
+   * seg-00001.ts
+   *
+   * Nhưng browser cần:
+   *
+   * /hls-segment/seg-00001.ts
+   */
+
+  playlist =
+    playlist.replace(
+      /^([^#\r\n]+\.ts)$/gm,
+      "/hls-segment/$1"
+    );
+
+  return playlist;
+}
+
+// ======================================================
+// DELAY PLAYLIST
+// ======================================================
+
+function getDelayedPlaylist() {
+
+  const file =
+    path.join(
+      HLS_DIR,
+      "index.m3u8"
+    );
+
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+
+  let playlist =
+    fs.readFileSync(
+      file,
       "utf8"
     );
 
   const lines =
-    playlist.split("\n");
+    playlist.split(/\r?\n/);
 
-  const targetSegments =
-    Math.ceil(
-      DELAY_SECONDS /
-      HLS_SEGMENT_SECONDS
+  const segmentPairs = [];
+
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
+
+    if (
+      lines[i].startsWith(
+        "#EXTINF:"
+      )
+    ) {
+
+      segmentPairs.push({
+        info: lines[i],
+        file: lines[i + 1]
+      });
+
+      i++;
+    }
+  }
+
+  const keepCount =
+    Math.max(
+      1,
+      segmentPairs.length -
+      Math.floor(
+        DELAY_SECONDS /
+        HLS_SEGMENT_SECONDS
+      )
     );
 
-  const segmentIndexes = [];
-
-  for (
-    let i = 0;
-    i < lines.length;
-    i++
-  ) {
-
-    if (
-      lines[i].startsWith(
-        "#EXTINF:"
-      )
-    ) {
-      segmentIndexes.push(i);
-    }
-  }
+  /*
+   * Nếu chưa đủ buffer thì dùng playlist hiện tại.
+   */
 
   if (
-    segmentIndexes.length <=
-    targetSegments
+    segmentPairs.length <=
+    keepCount
   ) {
-    return playlist;
+
+    return getPlaylist();
   }
 
-  const removeCount =
-    segmentIndexes.length -
-    targetSegments;
-
-  const firstKeepIndex =
-    segmentIndexes[removeCount];
-
-  const output = [];
+  const header = [];
 
   for (
     let i = 0;
@@ -467,23 +488,38 @@ function getDelayedPlaylist() {
   ) {
 
     if (
-      i >= firstKeepIndex ||
-      !lines[i].startsWith(
+      lines[i].startsWith(
         "#EXTINF:"
       )
     ) {
-
-      output.push(lines[i]);
+      break;
     }
 
-    if (
-      lines[i].startsWith(
-        "#EXTINF:"
-      ) &&
-      i < firstKeepIndex
-    ) {
-      continue;
+    if (lines[i].trim() !== "") {
+      header.push(lines[i]);
     }
+  }
+
+  const selected =
+    segmentPairs.slice(
+      0,
+      keepCount
+    );
+
+  const output = [
+    ...header
+  ];
+
+  for (const seg of selected) {
+
+    output.push(
+      seg.info
+    );
+
+    output.push(
+      "/hls-segment/" +
+      seg.file
+    );
   }
 
   return (
@@ -512,7 +548,7 @@ app.get(
       frames:
         totalFrames,
 
-      frameBuffer:
+      bufferFrames:
         frameBuffer.length,
 
       mjpeg: {
@@ -531,23 +567,12 @@ app.get(
 );
 
 // ======================================================
-// WEB PLAYER
+// WEB
 // ======================================================
 
 app.get(
   "/",
   (req, res) => {
-
-    const safeSource =
-      String(source)
-        .replace(
-          /&/g,
-          "&amp;"
-        )
-        .replace(
-          /"/g,
-          "&quot;"
-        );
 
     res.send(`
 <!DOCTYPE html>
@@ -575,17 +600,11 @@ body {
   padding: 0;
   background: #000;
   color: #fff;
-  font-family: Arial, sans-serif;
+  font-family: Arial;
 }
 
 body {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
-
-h2 {
-  margin: 15px;
+  text-align: center;
 }
 
 video {
@@ -594,16 +613,10 @@ video {
   background: #000;
 }
 
-.info {
-  padding: 15px;
-  text-align: center;
-}
-
 button {
-  font-size: 18px;
+  margin: 15px;
   padding: 12px 25px;
-  border: 0;
-  border-radius: 8px;
+  font-size: 18px;
 }
 
 </style>
@@ -621,27 +634,27 @@ button {
   preload="auto">
 </video>
 
-<div class="info">
+<br>
 
 <button id="play">
-▶ Phát
+▶ PHÁT
 </button>
 
 <p>
-Bấm Phát để bật hình và âm thanh.
+HLS Video + Audio
 </p>
-
-</div>
 
 <script>
 
 const video =
   document.getElementById("video");
 
-const play =
+const button =
   document.getElementById("play");
 
-function startHLS() {
+let hls = null;
+
+function start() {
 
   if (
     video.canPlayType(
@@ -651,39 +664,26 @@ function startHLS() {
 
     video.src = "/hls";
 
-    video.addEventListener(
-      "loadedmetadata",
-      () => {
-
-        console.log(
-          "HLS loaded"
-        );
-      }
-    );
-
+    return;
   }
-  else if (
+
+  if (
     Hls.isSupported()
   ) {
 
-    const hls =
-      new Hls({
+    hls = new Hls({
 
-        enableWorker: true,
+      enableWorker: true,
 
-        lowLatencyMode: false,
+      lowLatencyMode: false,
 
-        maxBufferLength: 30,
+      maxBufferLength: 30,
 
-        maxMaxBufferLength: 60,
+      maxMaxBufferLength: 60,
 
-        backBufferLength: 30,
+      backBufferLength: 30
 
-        liveSyncDurationCount: 3,
-
-        liveMaxLatencyDurationCount: 8
-
-      });
+    });
 
     hls.loadSource(
       "/hls"
@@ -695,20 +695,23 @@ function startHLS() {
 
     hls.on(
       Hls.Events.MANIFEST_PARSED,
-      () => {
+      function () {
 
         console.log(
-          "HLS ready"
+          "HLS READY"
         );
       }
     );
 
     hls.on(
       Hls.Events.ERROR,
-      (event, data) => {
+      function (
+        event,
+        data
+      ) {
 
         console.log(
-          "HLS error",
+          "HLS ERROR",
           data
         );
 
@@ -729,43 +732,32 @@ function startHLS() {
 
           hls.recoverMediaError();
         }
-
       }
-    );
-
-  }
-  else {
-
-    alert(
-      "Trình duyệt không hỗ trợ HLS."
     );
   }
 }
 
-play.addEventListener(
-  "click",
-  async () => {
+button.onclick =
+  async function () {
 
     try {
 
       await video.play();
 
-      play.style.display =
+      button.style.display =
         "none";
 
-    }
-    catch (err) {
+    } catch (e) {
 
-      console.error(err);
+      console.error(e);
 
       alert(
-        "Không thể phát video."
+        "Không thể phát video"
       );
     }
-  }
-);
+  };
 
-startHLS();
+start();
 
 </script>
 
@@ -777,7 +769,7 @@ startHLS();
 );
 
 // ======================================================
-// HLS PLAYLIST
+// HLS
 // ======================================================
 
 app.get(
@@ -813,11 +805,6 @@ app.get(
       "no-cache, no-store, must-revalidate"
     );
 
-    res.setHeader(
-      "Pragma",
-      "no-cache"
-    );
-
     res.send(
       playlist
     );
@@ -825,7 +812,7 @@ app.get(
 );
 
 // ======================================================
-// HLS SEGMENTS
+// HLS SEGMENT
 // ======================================================
 
 app.get(
@@ -871,7 +858,7 @@ app.get(
 );
 
 // ======================================================
-// MJPEG STREAM
+// MJPEG
 // ======================================================
 
 app.get(
@@ -900,6 +887,8 @@ app.get(
 
     let closed = false;
 
+    let lastTime = 0;
+
     req.on(
       "close",
       () => {
@@ -907,24 +896,22 @@ app.get(
       }
     );
 
-    let lastFrameTime = 0;
-
-    function sendFrame() {
+    function send() {
 
       if (closed) {
         return;
       }
 
-      /*
-       * Chọn frame khoảng DELAY_SECONDS
-       * phía sau hiện tại.
-       */
-
-      const targetTime =
+      const target =
         Date.now() -
         DELAY_SECONDS * 1000;
 
       let selected = null;
+
+      /*
+       * Tìm frame cũ nhất nhưng vẫn
+       * gần mốc delay.
+       */
 
       for (
         let i = 0;
@@ -934,32 +921,31 @@ app.get(
 
         if (
           frameBuffer[i].time <=
-          targetTime
+          target
         ) {
 
           selected =
             frameBuffer[i];
 
-        }
-        else {
+        } else {
+
           break;
         }
       }
 
       if (
         selected &&
-        selected.time !==
-          lastFrameTime
+        selected.time !== lastTime
       ) {
 
         try {
 
           res.write(
-            "--frame\\r\\n" +
-            "Content-Type: image/jpeg\\r\\n" +
+            "--frame\r\n" +
+            "Content-Type: image/jpeg\r\n" +
             "Content-Length: " +
             selected.data.length +
-            "\\r\\n\\r\\n"
+            "\r\n\r\n"
           );
 
           res.write(
@@ -967,14 +953,13 @@ app.get(
           );
 
           res.write(
-            "\\r\\n"
+            "\r\n"
           );
 
-          lastFrameTime =
+          lastTime =
             selected.time;
 
-        }
-        catch (_) {
+        } catch (_) {
 
           closed = true;
 
@@ -983,12 +968,12 @@ app.get(
       }
 
       setTimeout(
-        sendFrame,
+        send,
         1000 / MJPEG_FPS
       );
     }
 
-    sendFrame();
+    send();
   }
 );
 
@@ -1005,7 +990,7 @@ app.use(
 );
 
 // ======================================================
-// START SERVER
+// START
 // ======================================================
 
 app.listen(
@@ -1013,23 +998,11 @@ app.listen(
   () => {
 
     log(
-      `Server running on port ${PORT}`
+      `Server running :${PORT}`
     );
 
     log(
       `Source: ${source}`
-    );
-
-    log(
-      `Web: /`
-    );
-
-    log(
-      `HLS: /hls`
-    );
-
-    log(
-      `MJPEG: /stream`
     );
 
     log(
@@ -1051,7 +1024,7 @@ app.listen(
 function shutdown() {
 
   log(
-    "Shutting down..."
+    "Stopping..."
   );
 
   if (ffmpegProcess) {
@@ -1060,8 +1033,7 @@ function shutdown() {
       ffmpegProcess.kill(
         "SIGTERM"
       );
-    }
-    catch (_) {}
+    } catch (_) {}
   }
 
   process.exit(0);

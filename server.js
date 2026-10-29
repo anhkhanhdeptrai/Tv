@@ -1,3 +1,4 @@
+
 const express = require("express");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -655,7 +656,18 @@ let ffmpeg = null;
 
 let ffmpegGeneration = 0;
 
+let ffmpegAudio = null;
+
+let ffmpegAudioGeneration = 0;
+
 const frames = [];
+
+const audioQueue = [];
+
+let audioQueueBytes = 0;
+
+const MAX_AUDIO_QUEUE_BYTES =
+  2 * 1024 * 1024;
 
 let jpegBuffer =
   Buffer.alloc(0);
@@ -717,6 +729,167 @@ function stopFFmpeg() {
   ffmpeg = null;
 }
 
+function stopAudioFFmpeg() {
+
+  if (!ffmpegAudio) {
+    audioQueue.length = 0;
+    audioQueueBytes = 0;
+    return;
+  }
+
+  try {
+    ffmpegAudio.kill("SIGKILL");
+  } catch {}
+
+  ffmpegAudio = null;
+  audioQueue.length = 0;
+  audioQueueBytes = 0;
+}
+
+function queueAudioChunk(chunk) {
+
+  if (
+    !chunk ||
+    chunk.length === 0
+  ) {
+    return;
+  }
+
+  const audioChunk =
+    Buffer.from(chunk);
+
+  while (
+    audioQueueBytes +
+      audioChunk.length >
+      MAX_AUDIO_QUEUE_BYTES &&
+    audioQueue.length
+  ) {
+    const removed =
+      audioQueue.shift();
+    audioQueueBytes -=
+      removed.length;
+  }
+
+  audioQueue.push(
+    audioChunk
+  );
+
+  audioQueueBytes +=
+    audioChunk.length;
+}
+
+// =====================================================
+// START AUDIO FFMPEG
+// =====================================================
+
+function startAudioFFmpeg(channel) {
+
+  if (
+    !channel ||
+    !channel.url
+  ) {
+    return;
+  }
+
+  ffmpegAudioGeneration++;
+
+  const generation =
+    ffmpegAudioGeneration;
+
+  stopAudioFFmpeg();
+
+  ffmpegAudio = spawn(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_delay_max",
+      "5",
+      "-fflags",
+      "nobuffer",
+      "-i",
+      channel.url,
+      "-vn",
+      "-ac",
+      "1",
+      "-ar",
+      "44100",
+      "-c:a",
+      "pcm_s16le",
+      "-f",
+      "s16le",
+      "pipe:1"
+    ]
+  );
+
+  ffmpegAudio.stderr.on(
+    "data",
+    data => {
+      const text =
+        data
+          .toString()
+          .trim();
+
+      if (text) {
+        console.log(
+          "[FFmpeg Audio]",
+          text
+        );
+      }
+    }
+  );
+
+  ffmpegAudio.stdout.on(
+    "data",
+    chunk => {
+      if (
+        generation !==
+        ffmpegAudioGeneration
+      ) {
+        return;
+      }
+
+      queueAudioChunk(
+        chunk
+      );
+    }
+  );
+
+  ffmpegAudio.on(
+    "close",
+    code => {
+      if (
+        generation !==
+        ffmpegAudioGeneration
+      ) {
+        return;
+      }
+
+      ffmpegAudio = null;
+
+      setTimeout(
+        () => {
+          if (
+            generation ===
+              ffmpegAudioGeneration &&
+            currentChannel
+          ) {
+            startAudioFFmpeg(
+              currentChannel
+            );
+          }
+        },
+        3000
+      );
+    }
+  );
+}
+
 // =====================================================
 // START FFMPEG
 // =====================================================
@@ -747,6 +920,7 @@ function startFFmpeg(channel) {
   );
 
   stopFFmpeg();
+  stopAudioFFmpeg();
 
   clearHLS();
 
@@ -856,6 +1030,10 @@ function startFFmpeg(channel) {
 
       "pipe:1"
     ]
+  );
+
+  startAudioFFmpeg(
+    channel
   );
 
   // =========================================
@@ -1245,6 +1423,28 @@ app.get(
   "/stream",
   (req, res) => {
 
+    const requestedUrl =
+      req.query.url ||
+      req.query.channelUrl;
+
+    if (requestedUrl) {
+      const customChannel = {
+        id: "custom",
+        name: "Custom stream",
+        group: "custom",
+        url: requestedUrl,
+        checking: false,
+        available: true,
+        error: null
+      };
+
+      currentChannel =
+        customChannel;
+      startFFmpeg(
+        customChannel
+      );
+    }
+
     res.statusCode = 200;
 
     res.setHeader(
@@ -1296,6 +1496,39 @@ app.get(
           if (closed) {
             clearInterval(timer);
             return;
+          }
+
+          while (
+            audioQueue.length
+          ) {
+            const audioChunk =
+              audioQueue.shift();
+            audioQueueBytes -=
+              audioChunk.length;
+
+            try {
+              res.write(
+                "--frame\r\n"
+              );
+              res.write(
+                "Content-Type: audio/L16; rate=44100; channels=1\r\n"
+              );
+              res.write(
+                "Content-Length: " +
+                  audioChunk.length +
+                  "\r\n\r\n"
+              );
+              res.write(
+                audioChunk
+              );
+              res.write(
+                "\r\n"
+              );
+            } catch {
+              closed = true;
+              clearInterval(timer);
+              return;
+            }
           }
 
           if (

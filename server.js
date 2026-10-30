@@ -35,7 +35,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_FRAME_MS / 1000;
 
-const AUDIO_BUFFER_MS = 200;
+const AUDIO_BUFFER_MS = 500;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -115,17 +115,9 @@ function parseM3U(content) {
 
     const url = line;
 
-    if (!/^https?:\/\//i.test(url)) {
-      currentInfo = null;
-      continue;
-    }
-
-    if (/\.mpd($|\?)/i.test(url)) {
-      currentInfo = null;
-      continue;
-    }
-
-    if (/geo[\s_-]*blocked/i.test(currentInfo)) {
+    // Không lọc mạnh nữa: cần lấy hết kênh từ M3U, kể cả 720p/540p và các kênh
+    // có định dạng hơi khác hoặc đang lỗi, để người dùng có thể chọn thật sự.
+    if (!url || !url.trim()) {
       currentInfo = null;
       continue;
     }

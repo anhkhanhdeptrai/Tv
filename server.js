@@ -1,807 +1,1098 @@
 const express = require("express");
 const { spawn } = require("child_process");
+const https = require("https");
+const http = require("http");
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 10000;
 
-const PORT = process.env.PORT || 3000;
-const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
+const M3U_URL =
+"https://raw.githubusercontent.com/iptv-org/iptv/master/streams/vn.m3u";
 
-const CHANNELS_URL =
-  process.env.CHANNELS_URL ||
-  "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/vn.m3u";
+// =====================================================
+// VIDEO CONFIG
+// =====================================================
 
-const WIDTH = Number(process.env.WIDTH || 340);
-const HEIGHT = Number(process.env.HEIGHT || 230);
-const FPS = Number(process.env.FPS || 15);
-const JPEG_QUALITY = Number(process.env.JPEG_QUALITY || 8);
+const WIDTH = 320;
+const HEIGHT = 180;
+const FPS = 8;
+const JPEG_QUALITY = 10;
 
-const AUDIO_RATE = 44100;
+const MAX_JPEG_BUFFER = 1024 * 1024;
+
+// =====================================================
+// AUDIO CONFIG
+// =====================================================
+
+const AUDIO_SAMPLE_RATE = 44100;
 const AUDIO_CHANNELS = 1;
-const AUDIO_CHUNK_MS = 20;
-const AUDIO_CHUNK_SIZE =
-  (AUDIO_RATE * AUDIO_CHANNELS * 2 * AUDIO_CHUNK_MS) / 1000;
+const AUDIO_BYTES_PER_SAMPLE = 2;
 
-const FALLBACK_CHANNEL = {
-  id: "can-tho-tv1",
-  name: "Cần Thơ TV1",
-  url: "https://live.canthotv.vn/live/tv/chunklist.m3u8",
-};
+const AUDIO_BUFFER_MAX =
+AUDIO_SAMPLE_RATE *
+AUDIO_CHANNELS *
+AUDIO_BYTES_PER_SAMPLE *
+0.2;
+
+const AUDIO_CHUNK_SIZE = Math.floor(
+AUDIO_SAMPLE_RATE *
+AUDIO_CHANNELS *
+AUDIO_BYTES_PER_SAMPLE *
+0.02
+);
+
+// =====================================================
+// NETWORK
+// =====================================================
+
+const M3U_TIMEOUT = 15000;
+const FFMPEG_RESTART_DELAY = 3000;
+
+// =====================================================
+// STATE
+// =====================================================
 
 let channels = [];
-let selectedChannel = null;
+let currentChannel = null;
+let ffmpeg = null;
 
-let generation = 0;
-let videoProcess = null;
-let audioProcess = null;
+let ffmpegGeneration = 0;
+let restartTimer = null;
+
+// =====================================================
+// VIDEO BUFFER
+// =====================================================
 
 let latestFrame = null;
-let frameSequence = 0;
-let lastVideoFrameAt = 0;
-let lastAudioDataAt = 0;
+let jpegBuffer = Buffer.alloc(0);
 
-let videoBuffer = Buffer.alloc(0);
+const JPEG_START = Buffer.from([0xff, 0xd8]);
+const JPEG_END = Buffer.from([0xff, 0xd9]);
+
+// =====================================================
+// AUDIO BUFFER
+// =====================================================
+
 let audioBuffer = Buffer.alloc(0);
 
-let videoRestartTimer = null;
-let audioRestartTimer = null;
-let videoWatchdogTimer = null;
+// =====================================================
+// DOWNLOAD M3U
+// =====================================================
 
-let videoRestartCount = 0;
-let audioRestartCount = 0;
+function downloadM3U(url) {
+return new Promise((resolve, reject) => {
+const protocol = url.startsWith("https:")
+? https
+: http;
 
-const clients = {
-  video: new Set(),
-  audio: new Set(),
-};
-
-const stats = {
-  videoFrames: 0,
-  videoFps: 0,
-  audioBytes: 0,
-  videoStartedAt: null,
-  audioStartedAt: null,
-  lastVideoError: null,
-  lastAudioError: null,
-};
-
-function log(...args) {
-  console.log(new Date().toISOString(), ...args);
-}
-
-function slugify(text) {
-  return String(text)
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-async function loadChannels() {
-  try {
-    log("Loading channel list...");
-
-    const response = await fetch(CHANNELS_URL);
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+const request = protocol.get(
+  url,
+  {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "*/*"
     }
+  },
+  response => {
+    if (
+      response.statusCode < 200 ||
+      response.statusCode >= 300
+    ) {
+      response.resume();
 
-    const text = await response.text();
-    const lines = text.split(/\r?\n/);
+      reject(
+        new Error(`M3U HTTP ${response.statusCode}`)
+      );
 
-    const result = [];
-    let currentName = "";
-
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-
-      if (line.startsWith("#EXTINF:")) {
-        const comma = line.lastIndexOf(",");
-        currentName =
-          comma >= 0 ? line.substring(comma + 1).trim() : "Unknown";
-      } else if (
-        line &&
-        !line.startsWith("#") &&
-        /^https?:\/\//i.test(line)
-      ) {
-        const name = currentName || "Unknown channel";
-
-        result.push({
-          id: `${slugify(name)}-${result.length}`,
-          name,
-          url: line,
-        });
-
-        currentName = "";
-      }
-    }
-
-    // Bổ sung kênh Cần Thơ TV1 nếu danh sách không có URL này.
-    if (!result.some((item) => item.url === FALLBACK_CHANNEL.url)) {
-      result.unshift(FALLBACK_CHANNEL);
-    }
-
-    channels = result;
-
-    log(`Loaded ${channels.length} channels`);
-    return channels;
-  } catch (error) {
-    log("Cannot load playlist:", error.message);
-
-    channels = [FALLBACK_CHANNEL];
-    return channels;
-  }
-}
-
-function clearRestartTimers() {
-  if (videoRestartTimer) clearTimeout(videoRestartTimer);
-  if (audioRestartTimer) clearTimeout(audioRestartTimer);
-  if (videoWatchdogTimer) clearTimeout(videoWatchdogTimer);
-
-  videoRestartTimer = null;
-  audioRestartTimer = null;
-  videoWatchdogTimer = null;
-}
-
-function stopChild(child) {
-  if (child && !child.killed) {
-    try {
-      child.kill("SIGTERM");
-    } catch (error) {
-      log("Cannot stop FFmpeg:", error.message);
-    }
-  }
-}
-
-function stopPipeline() {
-  generation++;
-
-  clearRestartTimers();
-
-  stopChild(videoProcess);
-  stopChild(audioProcess);
-
-  videoProcess = null;
-  audioProcess = null;
-
-  videoBuffer = Buffer.alloc(0);
-  audioBuffer = Buffer.alloc(0);
-
-  latestFrame = null;
-  lastVideoFrameAt = 0;
-  lastAudioDataAt = 0;
-
-  videoRestartCount = 0;
-  audioRestartCount = 0;
-
-  stats.videoFps = 0;
-  stats.videoStartedAt = null;
-  stats.audioStartedAt = null;
-}
-
-function armVideoWatchdog(gen) {
-  if (videoWatchdogTimer) {
-    clearTimeout(videoWatchdogTimer);
-  }
-
-  videoWatchdogTimer = setTimeout(() => {
-    if (gen !== generation || !selectedChannel) return;
-
-    const elapsed = Date.now() - lastVideoFrameAt;
-
-    if (lastVideoFrameAt && elapsed < 30000) {
-      armVideoWatchdog(gen);
       return;
     }
 
-    log("VIDEO WATCHDOG: no frame for 30 seconds");
+    let data = "";
 
-    stopChild(videoProcess);
-    videoProcess = null;
+    response.setEncoding("utf8");
 
-    scheduleRestart("video", gen);
-  }, 30000);
+    response.on("data", chunk => {
+      data += chunk;
+
+      if (data.length > 20 * 1024 * 1024) {
+        request.destroy(
+          new Error("M3U quá lớn")
+        );
+      }
+    });
+
+    response.on("end", () => {
+      resolve(data);
+    });
+  }
+);
+
+request.setTimeout(M3U_TIMEOUT, () => {
+  request.destroy(new Error("M3U timeout"));
+});
+
+request.on("error", reject);
+
+});
 }
 
-function scheduleRestart(type, gen) {
-  if (gen !== generation || !selectedChannel) return;
+// =====================================================
+// PARSE M3U
+// =====================================================
 
-  const isVideo = type === "video";
-  const currentTimer = isVideo ? videoRestartTimer : audioRestartTimer;
+function parseM3U(text) {
+const lines = text
+.split(/\r?\n/)
+.map(x => x.trim())
+.filter(Boolean);
 
-  if (currentTimer) return;
+const result = [];
 
-  const attempt = isVideo ? videoRestartCount++ : audioRestartCount++;
-  const delay = Math.min(1000 * Math.pow(2, attempt), 15000);
+for (let i = 0; i < lines.length; i++) {
+const line = lines[i];
 
-  log(`${type.toUpperCase()}: restarting in ${delay / 1000}s`);
+if (!line.startsWith("#EXTINF")) {
+  continue;
+}
 
-  const timer = setTimeout(() => {
-    if (gen !== generation || !selectedChannel) return;
+let name = line
+  .substring(line.lastIndexOf(",") + 1)
+  .trim();
 
-    if (isVideo) {
-      videoRestartTimer = null;
-      startVideo(gen);
-    } else {
-      audioRestartTimer = null;
-      startAudio(gen);
-    }
-  }, delay);
+const tvgId =
+  (line.match(/tvg-id="([^"]*)"/i) || [])[1] || "";
 
-  if (isVideo) {
-    videoRestartTimer = timer;
-  } else {
-    audioRestartTimer = timer;
+const tvgName =
+  (line.match(/tvg-name="([^"]*)"/i) || [])[1] || "";
+
+const logo =
+  (line.match(/tvg-logo="([^"]*)"/i) || [])[1] || "";
+
+const group =
+  (line.match(/group-title="([^"]*)"/i) || [])[1] || "";
+
+let url = "";
+
+for (let j = i + 1; j < lines.length; j++) {
+  if (!lines[j].startsWith("#")) {
+    url = lines[j];
+    break;
   }
 }
 
-function parseJpegFrames(data, gen) {
-  if (gen !== generation) return;
+if (!url) continue;
 
-  videoBuffer = Buffer.concat([videoBuffer, data]);
+if (!name) {
+  name =
+    tvgName ||
+    tvgId ||
+    `Channel ${result.length + 1}`;
+}
 
-  // Không cho bộ đệm tăng vô hạn nếu nguồn bị lỗi.
-  if (videoBuffer.length > 5 * 1024 * 1024) {
-    const soi = videoBuffer.lastIndexOf(Buffer.from([0xff, 0xd8]));
+if (
+  line.includes("[Geo-blocked]") ||
+  name.includes("[Geo-blocked]")
+) {
+  continue;
+}
 
-    if (soi >= 0) {
-      videoBuffer = videoBuffer.subarray(soi);
-    } else {
-      videoBuffer = Buffer.alloc(0);
-    }
+if (url.toLowerCase().includes(".mpd")) {
+  continue;
+}
+
+result.push({
+  id: String(result.length),
+  name,
+  tvgId,
+  tvgName,
+  logo,
+  group,
+  url
+});
+
+}
+
+return result;
+}
+
+// =====================================================
+// CLEAR BUFFERS
+// =====================================================
+
+function clearVideoBuffer() {
+latestFrame = null;
+jpegBuffer = Buffer.alloc(0);
+}
+
+function clearAudioBuffer() {
+audioBuffer = Buffer.alloc(0);
+}
+
+function clearAllBuffers() {
+clearVideoBuffer();
+clearAudioBuffer();
+}
+
+// =====================================================
+// STOP FFMPEG
+// =====================================================
+
+function stopFFmpeg(clearChannel = true) {
+ffmpegGeneration++;
+
+if (restartTimer) {
+clearTimeout(restartTimer);
+restartTimer = null;
+}
+
+const oldFFmpeg = ffmpeg;
+
+ffmpeg = null;
+
+if (clearChannel) {
+currentChannel = null;
+}
+
+if (oldFFmpeg) {
+try {
+oldFFmpeg.kill("SIGKILL");
+} catch (error) {
+console.log(
+"Không thể dừng FFmpeg:",
+error.message
+);
+}
+}
+
+clearAllBuffers();
+}
+
+// =====================================================
+// START FFMPEG PROCESS
+// =====================================================
+
+function launchFFmpeg(channel) {
+if (!channel || !channel.url) {
+return false;
+}
+
+const generation = ffmpegGeneration;
+
+console.log("");
+console.log("======================================");
+console.log("START CHANNEL:", channel.name);
+console.log("URL:", channel.url);
+console.log("GENERATION:", generation);
+console.log("======================================");
+
+const args = [
+"-hide_banner",
+"-loglevel", "warning",
+
+// INPUT
+"-thread_queue_size", "512",
+"-threads", "2",
+
+// HTTP / HLS RECONNECT
+"-reconnect", "1",
+"-reconnect_streamed", "1",
+"-reconnect_at_eof", "1",
+"-reconnect_delay_max", "5",
+"-rw_timeout", "15000000",
+"-user_agent", "Mozilla/5.0",
+
+// TIMESTAMP / CORRUPT PACKETS
+"-fflags", "+genpts+discardcorrupt",
+"-err_detect", "ignore_err",
+
+"-i", channel.url,
+
+// =============================================
+// OUTPUT 1: VIDEO MJPEG
+// =============================================
+
+"-map", "0:v:0",
+"-an",
+
+"-vf",
+`fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuvj420p`,
+
+"-c:v", "mjpeg",
+"-q:v", String(JPEG_QUALITY),
+"-threads:v", "1",
+"-pix_fmt", "yuvj420p",
+
+"-flush_packets", "1",
+"-f", "image2pipe",
+"pipe:1",
+
+// =============================================
+// OUTPUT 2: AUDIO PCM
+// =============================================
+
+"-map", "0:a:0?",
+"-vn",
+
+"-ac", String(AUDIO_CHANNELS),
+"-ar", String(AUDIO_SAMPLE_RATE),
+
+"-c:a", "pcm_s16le",
+"-threads:a", "1",
+
+"-flush_packets", "1",
+"-f", "s16le",
+"pipe:3"
+
+];
+
+let processFFmpeg;
+
+try {
+processFFmpeg = spawn(
+"ffmpeg",
+args,
+{
+stdio: [
+"ignore",
+"pipe",
+"pipe",
+"pipe"
+]
+}
+);
+} catch (error) {
+console.log(
+"FFMPEG SPAWN ERROR:",
+error.message
+);
+
+return false;
+
+}
+
+ffmpeg = processFFmpeg;
+
+// =================================================
+// STDERR
+// =================================================
+
+processFFmpeg.stderr.on("data", data => {
+if (
+generation !== ffmpegGeneration ||
+processFFmpeg !== ffmpeg
+) {
+return;
+}
+
+const message = data.toString().trim();
+
+if (message) {
+  console.log("[FFmpeg]", message);
+}
+
+});
+
+// =================================================
+// VIDEO STREAM - LOW LATENCY JPEG PARSER
+// =================================================
+
+processFFmpeg.stdout.on("data", chunk => {
+if (
+generation !== ffmpegGeneration ||
+processFFmpeg !== ffmpeg
+) {
+return;
+}
+
+jpegBuffer = Buffer.concat([
+  jpegBuffer,
+  chunk
+]);
+
+while (jpegBuffer.length >= 4) {
+  const start = jpegBuffer.indexOf(JPEG_START);
+
+  if (start === -1) {
+    const last = jpegBuffer[jpegBuffer.length - 1];
+
+    jpegBuffer = last === 0xff
+      ? Buffer.from([0xff])
+      : Buffer.alloc(0);
+
+    break;
   }
 
-  const SOI = Buffer.from([0xff, 0xd8]);
-  const EOI = Buffer.from([0xff, 0xd9]);
+  if (start > 0) {
+    jpegBuffer = jpegBuffer.subarray(start);
+  }
 
-  while (true) {
-    const start = videoBuffer.indexOf(SOI);
+  const end = jpegBuffer.indexOf(JPEG_END, 2);
 
-    if (start < 0) {
-      videoBuffer = Buffer.alloc(0);
+  if (end === -1) {
+    if (jpegBuffer.length > MAX_JPEG_BUFFER) {
+      const next = jpegBuffer.indexOf(
+        JPEG_START,
+        2
+      );
+
+      if (next >= 0) {
+        jpegBuffer = jpegBuffer.subarray(next);
+      } else {
+        jpegBuffer = Buffer.alloc(0);
+      }
+    }
+
+    break;
+  }
+
+  const jpeg = Buffer.from(
+    jpegBuffer.subarray(0, end + 2)
+  );
+
+  jpegBuffer = jpegBuffer.subarray(end + 2);
+
+  if (jpeg.length < 100) {
+    continue;
+  }
+
+  if (
+    jpeg[0] !== 0xff ||
+    jpeg[1] !== 0xd8 ||
+    jpeg[jpeg.length - 2] !== 0xff ||
+    jpeg[jpeg.length - 1] !== 0xd9
+  ) {
+    continue;
+  }
+
+  // CHỈ GIỮ FRAME MỚI NHẤT
+  latestFrame = {
+    data: jpeg,
+    time: Date.now(),
+    generation
+  };
+}
+
+});
+
+// =================================================
+// VIDEO PIPE ERROR
+// =================================================
+
+processFFmpeg.stdout.on("error", error => {
+if (generation === ffmpegGeneration) {
+console.log(
+"[VIDEO PIPE ERROR]",
+error.message
+);
+}
+});
+
+// =================================================
+// AUDIO STREAM
+// =================================================
+
+processFFmpeg.stdio[3].on("data", chunk => {
+if (
+generation !== ffmpegGeneration ||
+processFFmpeg !== ffmpeg
+) {
+return;
+}
+
+audioBuffer = Buffer.concat([
+  audioBuffer,
+  chunk
+]);
+
+// GIỚI HẠN AUDIO 200MS
+if (audioBuffer.length > AUDIO_BUFFER_MAX) {
+  let start =
+    audioBuffer.length - AUDIO_BUFFER_MAX;
+
+  // Giữ số byte chẵn cho PCM 16-bit
+  if (start % 2 !== 0) {
+    start++;
+  }
+
+  audioBuffer = audioBuffer.subarray(start);
+}
+
+});
+
+// =================================================
+// AUDIO PIPE ERROR
+// =================================================
+
+processFFmpeg.stdio[3].on("error", error => {
+if (generation === ffmpegGeneration) {
+console.log(
+"[AUDIO PIPE ERROR]",
+error.message
+);
+}
+});
+
+// =================================================
+// PROCESS ERROR
+// =================================================
+
+processFFmpeg.on("error", error => {
+if (generation !== ffmpegGeneration) {
+return;
+}
+
+console.log("======================================");
+console.log("FFMPEG PROCESS ERROR");
+console.log(error.message);
+console.log("======================================");
+
+});
+
+// =================================================
+// PROCESS CLOSE / AUTO RESTART
+// =================================================
+
+processFFmpeg.on("close", (code, signal) => {
+if (
+generation !== ffmpegGeneration ||
+processFFmpeg !== ffmpeg
+) {
+return;
+}
+
+console.log("======================================");
+console.log("FFMPEG CLOSED");
+console.log("Exit code:", code);
+console.log("Signal:", signal);
+console.log("Channel:", channel.name);
+console.log("======================================");
+
+ffmpeg = null;
+
+clearAllBuffers();
+
+if (
+  currentChannel &&
+  generation === ffmpegGeneration
+) {
+  console.log(
+    `FFmpeg thử lại sau ${FFMPEG_RESTART_DELAY / 1000}s`
+  );
+
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+  }
+
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+
+    if (
+      generation !== ffmpegGeneration ||
+      !currentChannel ||
+      ffmpeg
+    ) {
       return;
     }
 
-    if (start > 0) {
-      videoBuffer = videoBuffer.subarray(start);
-    }
+    console.log("ĐANG KẾT NỐI LẠI IPTV...");
 
-    const end = videoBuffer.indexOf(EOI, 2);
+    launchFFmpeg(currentChannel);
 
-    if (end < 0) return;
-
-    const frame = videoBuffer.subarray(0, end + 2);
-    videoBuffer = videoBuffer.subarray(end + 2);
-
-    latestFrame = frame;
-    frameSequence++;
-
-    stats.videoFrames++;
-    lastVideoFrameAt = Date.now();
-
-    // Có frame mới thì reset watchdog.
-    armVideoWatchdog(gen);
-  }
+  }, FFMPEG_RESTART_DELAY);
 }
 
-function broadcastAudio(data) {
-  if (!data || data.length === 0) return;
+});
 
-  audioBuffer = Buffer.concat([audioBuffer, data]);
-
-  // Giới hạn bộ đệm audio tối đa khoảng 1 giây.
-  const maxBuffer = AUDIO_RATE * 2 * 2;
-
-  if (audioBuffer.length > maxBuffer) {
-    audioBuffer = audioBuffer.subarray(
-      audioBuffer.length - maxBuffer
-    );
-  }
-
-  while (audioBuffer.length >= AUDIO_CHUNK_SIZE) {
-    const chunk = audioBuffer.subarray(0, AUDIO_CHUNK_SIZE);
-    audioBuffer = audioBuffer.subarray(AUDIO_CHUNK_SIZE);
-
-    for (const client of clients.audio) {
-      if (client.destroyed || client.writableEnded) {
-        clients.audio.delete(client);
-        continue;
-      }
-
-      // Client đọc chậm: bỏ chunk cũ, không để hàng đợi tăng vô hạn.
-      if (client.writableLength > 65536) {
-        continue;
-      }
-
-      try {
-        client.write(chunk);
-      } catch {
-        clients.audio.delete(client);
-      }
-    }
-  }
+return true;
 }
 
-function startVideo(gen) {
-  if (gen !== generation || !selectedChannel) return;
+// =====================================================
+// SELECT CHANNEL
+// =====================================================
 
-  const channel = selectedChannel;
-
-  log("======================================");
-  log(`START VIDEO: ${channel.name}`);
-  log(`URL: ${channel.url}`);
-  log("======================================");
-
-  videoBuffer = Buffer.alloc(0);
-  lastVideoFrameAt = Date.now();
-  stats.videoStartedAt = new Date().toISOString();
-
-  const args = [
-    "-hide_banner",
-    "-loglevel", "warning",
-
-    // Tự chọn số luồng giải mã.
-    "-threads:v", "0",
-    "-filter_threads", "2",
-
-    "-rw_timeout", "15000000",
-    "-analyzeduration", "5000000",
-    "-probesize", "5000000",
-
-    "-i", channel.url,
-
-    "-map", "0:v:0",
-    "-an",
-    "-sn",
-    "-dn",
-
-    "-vf",
-    `fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,format=yuvj420p`,
-
-    "-c:v", "mjpeg",
-    "-q:v", String(JPEG_QUALITY),
-
-    // Luồng encode riêng, không khóa decoder.
-    "-threads:v", "2",
-
-    "-flush_packets", "1",
-    "-f", "image2pipe",
-    "pipe:1",
-  ];
-
-  let child;
-
-  try {
-    child = spawn(FFMPEG, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    stats.lastVideoError = error.message;
-    log("VIDEO SPAWN ERROR:", error.message);
-    scheduleRestart("video", gen);
-    return;
-  }
-
-  videoProcess = child;
-
-  child.stdout.on("data", (data) => {
-    if (gen !== generation) return;
-    parseJpegFrames(data, gen);
-  });
-
-  child.stderr.on("data", (data) => {
-    if (gen !== generation) return;
-
-    const message = data.toString().trim();
-
-    if (message) {
-      stats.lastVideoError = message;
-      log("[FFmpeg VIDEO]", message);
-    }
-  });
-
-  child.on("error", (error) => {
-    if (gen !== generation) return;
-
-    stats.lastVideoError = error.message;
-    log("VIDEO PROCESS ERROR:", error.message);
-  });
-
-  child.on("close", (code, signal) => {
-    if (gen !== generation) return;
-
-    log(`VIDEO FFmpeg exited: code=${code}, signal=${signal}`);
-
-    if (videoProcess === child) {
-      videoProcess = null;
-    }
-
-    if (videoWatchdogTimer) {
-      clearTimeout(videoWatchdogTimer);
-      videoWatchdogTimer = null;
-    }
-
-    scheduleRestart("video", gen);
-  });
-
-  armVideoWatchdog(gen);
+function startFFmpeg(channel) {
+if (!channel || !channel.url) {
+return false;
 }
 
-function startAudio(gen) {
-  if (gen !== generation || !selectedChannel) return;
+if (
+currentChannel &&
+currentChannel.id === channel.id &&
+ffmpeg &&
+ffmpeg.exitCode === null
+) {
+console.log(
+"Channel already playing:",
+channel.name
+);
 
-  const channel = selectedChannel;
+return true;
 
-  log(`START AUDIO: ${channel.name}`);
-
-  audioBuffer = Buffer.alloc(0);
-  stats.audioStartedAt = new Date().toISOString();
-
-  const args = [
-    "-hide_banner",
-    "-loglevel", "warning",
-
-    "-threads:a", "0",
-    "-rw_timeout", "15000000",
-    "-analyzeduration", "5000000",
-    "-probesize", "5000000",
-
-    "-i", channel.url,
-
-    "-map", "0:a:0?",
-    "-vn",
-    "-sn",
-    "-dn",
-
-    "-ac", String(AUDIO_CHANNELS),
-    "-ar", String(AUDIO_RATE),
-
-    "-c:a", "pcm_s16le",
-    "-flush_packets", "1",
-    "-f", "s16le",
-    "pipe:1",
-  ];
-
-  let child;
-
-  try {
-    child = spawn(FFMPEG, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    stats.lastAudioError = error.message;
-    log("AUDIO SPAWN ERROR:", error.message);
-    scheduleRestart("audio", gen);
-    return;
-  }
-
-  audioProcess = child;
-
-  child.stdout.on("data", (data) => {
-    if (gen !== generation) return;
-
-    lastAudioDataAt = Date.now();
-    stats.audioBytes += data.length;
-    audioRestartCount = 0;
-
-    broadcastAudio(data);
-  });
-
-  child.stderr.on("data", (data) => {
-    if (gen !== generation) return;
-
-    const message = data.toString().trim();
-
-    if (message) {
-      stats.lastAudioError = message;
-      log("[FFmpeg AUDIO]", message);
-    }
-  });
-
-  child.on("error", (error) => {
-    if (gen !== generation) return;
-
-    stats.lastAudioError = error.message;
-    log("AUDIO PROCESS ERROR:", error.message);
-  });
-
-  child.on("close", (code, signal) => {
-    if (gen !== generation) return;
-
-    log(`AUDIO FFmpeg exited: code=${code}, signal=${signal}`);
-
-    if (audioProcess === child) {
-      audioProcess = null;
-    }
-
-    scheduleRestart("audio", gen);
-  });
 }
 
-function selectChannel(channel) {
-  if (!channel) return false;
+stopFFmpeg(true);
 
-  stopPipeline();
+currentChannel = channel;
 
-  selectedChannel = channel;
-
-  const gen = generation;
-
-  log(`SELECT CHANNEL: ${channel.name}`);
-
-  startVideo(gen);
-  startAudio(gen);
-
-  return true;
+return launchFFmpeg(channel);
 }
 
-// ===============================
-// API: CHANNEL LIST
-// ===============================
+// =====================================================
+// API CHANNELS
+// =====================================================
 
 app.get("/api/channels", (req, res) => {
-  res.json({
-    success: true,
-    count: channels.length,
-    channels,
-    selected: selectedChannel,
-  });
+res.json({
+count: channels.length,
+
+current: currentChannel
+  ? currentChannel.id
+  : null,
+
+playing: !!ffmpeg,
+
+channels: channels.map(channel => ({
+  id: channel.id,
+  name: channel.name,
+  group: channel.group,
+  logo: channel.logo
+}))
+
+});
 });
 
-// ===============================
-// API: SELECT CHANNEL
-// ===============================
+// =====================================================
+// API SELECT
+// =====================================================
 
 app.get("/api/select/:id", (req, res) => {
-  const channel = channels.find(
-    (item) => item.id === req.params.id
-  );
+const channel = channels.find(
+ch => ch.id === String(req.params.id)
+);
 
-  if (!channel) {
-    return res.status(404).json({
-      success: false,
-      error: "Channel not found",
-    });
-  }
-
-  selectChannel(channel);
-
-  res.json({
-    success: true,
-    message: "Channel selected",
-    channel,
-  });
+if (!channel) {
+return res.status(404).json({
+ok: false,
+error: "Không tìm thấy kênh"
 });
-
-// Hỗ trợ cả POST nếu client đang dùng POST.
-app.post("/api/select/:id", (req, res) => {
-  const channel = channels.find(
-    (item) => item.id === req.params.id
-  );
-
-  if (!channel) {
-    return res.status(404).json({
-      success: false,
-      error: "Channel not found",
-    });
-  }
-
-  selectChannel(channel);
-
-  res.json({
-    success: true,
-    message: "Channel selected",
-    channel,
-  });
-});
-
-// ===============================
-// API: STOP
-// ===============================
-
-app.get("/api/stop", (req, res) => {
-  stopPipeline();
-  selectedChannel = null;
-
-  res.json({
-    success: true,
-    message: "Stopped",
-  });
-});
-
-app.post("/api/stop", (req, res) => {
-  stopPipeline();
-  selectedChannel = null;
-
-  res.json({
-    success: true,
-    message: "Stopped",
-  });
-});
-
-// ===============================
-// MJPEG STREAM
-// ===============================
-
-app.get("/stream", (req, res) => {
-  res.writeHead(200, {
-    "Content-Type": "multipart/x-mixed-replace; boundary=frame",
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    Pragma: "no-cache",
-    Expires: "0",
-    Connection: "keep-alive",
-    "Access-Control-Allow-Origin": "*",
-  });
-
-  let lastSentSequence = -1;
-
-  const timer = setInterval(() => {
-    if (res.destroyed || res.writableEnded) {
-      clearInterval(timer);
-      return;
-    }
-
-    if (!latestFrame || frameSequence === lastSentSequence) {
-      return;
-    }
-
-    // ESP32 đọc chậm thì không xếp hàng frame cũ.
-    if (res.writableLength > 512 * 1024) {
-      return;
-    }
-
-    lastSentSequence = frameSequence;
-
-    try {
-      res.write("--frame\r\n");
-      res.write("Content-Type: image/jpeg\r\n");
-      res.write(`Content-Length: ${latestFrame.length}\r\n\r\n`);
-      res.write(latestFrame);
-      res.write("\r\n");
-    } catch {
-      clearInterval(timer);
-      res.destroy();
-    }
-  }, Math.max(10, Math.floor(1000 / FPS)));
-
-  res.on("close", () => {
-    clearInterval(timer);
-  });
-});
-
-// ===============================
-// PCM AUDIO STREAM
-// ===============================
-
-app.get("/audio", (req, res) => {
-  res.writeHead(200, {
-    "Content-Type": "application/octet-stream",
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    Pragma: "no-cache",
-    Connection: "keep-alive",
-    "Access-Control-Allow-Origin": "*",
-    "X-Audio-Format": "S16LE",
-    "X-Sample-Rate": String(AUDIO_RATE),
-    "X-Channels": String(AUDIO_CHANNELS),
-    "X-Bits-Per-Sample": "16",
-  });
-
-  clients.audio.add(res);
-
-  res.on("close", () => {
-    clients.audio.delete(res);
-  });
-});
-
-// ===============================
-// HEALTH / STATUS
-// ===============================
-
-app.get("/health", (req, res) => {
-  res.json({
-    success: true,
-    status: "online",
-    uptime: process.uptime(),
-    selected: selectedChannel,
-    video: {
-      running: !!videoProcess && !videoProcess.killed,
-      width: WIDTH,
-      height: HEIGHT,
-      targetFps: FPS,
-      frames: stats.videoFrames,
-      fps: stats.videoFps,
-      lastFrameAgoMs: lastVideoFrameAt
-        ? Date.now() - lastVideoFrameAt
-        : null,
-      clients: 0,
-      restartCount: videoRestartCount,
-      lastError: stats.lastVideoError,
-    },
-    audio: {
-      running: !!audioProcess && !audioProcess.killed,
-      sampleRate: AUDIO_RATE,
-      channels: AUDIO_CHANNELS,
-      bytes: stats.audioBytes,
-      lastDataAgoMs: lastAudioDataAt
-        ? Date.now() - lastAudioDataAt
-        : null,
-      clients: clients.audio.size,
-      restartCount: audioRestartCount,
-      lastError: stats.lastAudioError,
-    },
-  });
-
-app.get("/api/status", (req, res) => {
-  res.json({
-    selected: selectedChannel,
-    videoRunning: !!videoProcess && !videoProcess.killed,
-    audioRunning: !!audioProcess && !audioProcess.killed,
-    videoFps: stats.videoFps,
-    frames: stats.videoFrames,
-    videoClients: clients.video.size,
-    audioClients: clients.audio.size,
-    lastVideoFrameAt,
-    lastAudioDataAt,
-    videoRestartCount,
-    audioRestartCount,
-    lastVideoError: stats.lastVideoError,
-    lastAudioError: stats.lastAudioError,
-  });
-});
-
-// ===============================
-// FPS COUNTER
-// ===============================
-
-let previousFrameCount = 0;
-
-setInterval(() => {
-  const current = stats.videoFrames;
-
-  stats.videoFps = current - previousFrameCount;
-  previousFrameCount = current;
-}, 1000);
-
-// ===============================
-// START SERVER
-// ===============================
-
-async function main() {
-  await loadChannels();
-
-  app.listen(PORT, "0.0.0.0", () => {
-    log(`Server listening on port ${PORT}`);
-    log(`Video: ${WIDTH}x${HEIGHT} @ ${FPS} FPS`);
-    log(`Audio: ${AUDIO_RATE} Hz mono S16LE`);
-  });
-
-  const defaultChannel =
-    channels.find((item) => item.id === "can-tho-tv1") ||
-    channels.find((item) =>
-      item.name.toLowerCase().includes("cần thơ tv1")
-    ) ||
-    channels[0];
-
-  if (defaultChannel) {
-    selectChannel(defaultChannel);
-  }
 }
 
-process.on("SIGTERM", () => {
-  log("SIGTERM received");
-  stopPipeline();
-  process.exit(0);
+const started = startFFmpeg(channel);
+
+if (!started) {
+return res.status(500).json({
+ok: false,
+error: "Không thể khởi động FFmpeg"
+});
+}
+
+res.json({
+ok: true,
+
+id: channel.id,
+name: channel.name,
+
+video: "/stream",
+audio: "/audio",
+
+format: {
+  video: `${WIDTH}x${HEIGHT} ${FPS}fps`,
+  audio: "PCM S16LE",
+  sampleRate: AUDIO_SAMPLE_RATE,
+  channels: AUDIO_CHANNELS,
+  bits: 16
+}
+
+});
 });
 
-process.on("SIGINT", () => {
-  log("SIGINT received");
-  stopPipeline();
-  process.exit(0);
+// =====================================================
+// API STOP
+// =====================================================
+
+app.get("/api/stop", (req, res) => {
+stopFFmpeg(true);
+
+res.json({
+ok: true,
+message: "Đã dừng phát"
+});
 });
 
-main().catch((error) => {
-  log("SERVER START ERROR:", error);
-  process.exit(1);
+// =====================================================
+// VIDEO MJPEG
+// =====================================================
+
+app.get("/stream", (req, res) => {
+if (!currentChannel || !ffmpeg) {
+return res.status(503).send("Chua chon kenh");
+}
+
+res.statusCode = 200;
+
+res.setHeader(
+"Content-Type",
+"multipart/x-mixed-replace; boundary=frame"
+);
+
+res.setHeader(
+"Cache-Control",
+"no-cache, no-store, must-revalidate"
+);
+
+res.setHeader("Pragma", "no-cache");
+res.setHeader("Expires", "0");
+res.setHeader("Connection", "keep-alive");
+
+res.removeHeader("Content-Encoding");
+
+if (req.socket) {
+req.socket.setNoDelay(true);
+req.socket.setKeepAlive(true);
+}
+
+res.flushHeaders();
+
+let closed = false;
+let waitingForDrain = false;
+let lastFrameTime = 0;
+
+const timer = setInterval(() => {
+if (closed || res.destroyed) {
+cleanup();
+return;
+}
+
+if (!currentChannel || !ffmpeg) {
+  return;
+}
+
+// KHÔNG TẠO HÀNG ĐỢI KHI CLIENT CHẬM
+if (waitingForDrain) {
+  return;
+}
+
+const frame = latestFrame;
+
+if (!frame) {
+  return;
+}
+
+if (frame.generation !== ffmpegGeneration) {
+  return;
+}
+
+if (frame.time === lastFrameTime) {
+  return;
+}
+
+// LUÔN LẤY FRAME MỚI NHẤT
+lastFrameTime = frame.time;
+
+const header = Buffer.from(
+  "--frame\r\n" +
+  "Content-Type: image/jpeg\r\n" +
+  "Content-Length: " +
+  frame.data.length +
+  "\r\n\r\n"
+);
+
+const packet = Buffer.concat([
+  header,
+  frame.data,
+  Buffer.from("\r\n")
+]);
+
+try {
+  const ok = res.write(packet);
+
+  if (!ok) {
+    waitingForDrain = true;
+  }
+} catch (error) {
+  cleanup();
+}
+
+}, 1000 / FPS);
+
+function cleanup() {
+if (closed) return;
+
+closed = true;
+
+clearInterval(timer);
+
+if (!res.destroyed) {
+  res.end();
+}
+
+}
+
+res.on("drain", () => {
+waitingForDrain = false;
+});
+
+res.on("close", () => {
+closed = true;
+clearInterval(timer);
+});
+
+res.on("error", () => {
+cleanup();
+});
+});
+
+// =====================================================
+// AUDIO PCM
+// =====================================================
+
+app.get("/audio", (req, res) => {
+if (!currentChannel || !ffmpeg) {
+return res.status(503).send("Chua chon kenh");
+}
+
+res.statusCode = 200;
+
+res.setHeader(
+"Content-Type",
+"application/octet-stream"
+);
+
+res.setHeader("X-Audio-Codec", "PCM_S16LE");
+
+res.setHeader(
+"X-Audio-Sample-Rate",
+String(AUDIO_SAMPLE_RATE)
+);
+
+res.setHeader(
+"X-Audio-Channels",
+String(AUDIO_CHANNELS)
+);
+
+res.setHeader("X-Audio-Bits", "16");
+
+res.setHeader(
+"Cache-Control",
+"no-cache, no-store, must-revalidate"
+);
+
+res.setHeader("Pragma", "no-cache");
+res.setHeader("Expires", "0");
+res.setHeader("Connection", "keep-alive");
+
+if (req.socket) {
+req.socket.setNoDelay(true);
+req.socket.setKeepAlive(true);
+}
+
+res.flushHeaders();
+
+let closed = false;
+let waitingForDrain = false;
+
+const timer = setInterval(() => {
+if (closed || res.destroyed) {
+cleanup();
+return;
+}
+
+if (!currentChannel || !ffmpeg) {
+  return;
+}
+
+if (waitingForDrain) {
+  return;
+}
+
+if (audioBuffer.length < AUDIO_CHUNK_SIZE) {
+  return;
+}
+
+const chunkSize =
+  AUDIO_CHUNK_SIZE -
+  (AUDIO_CHUNK_SIZE % 2);
+
+const chunk = audioBuffer.subarray(
+  0,
+  chunkSize
+);
+
+audioBuffer = audioBuffer.subarray(
+  chunkSize
+);
+
+try {
+  const ok = res.write(chunk);
+
+  if (!ok) {
+    waitingForDrain = true;
+  }
+} catch (error) {
+  cleanup();
+}
+
+}, 20);
+
+function cleanup() {
+if (closed) return;
+
+closed = true;
+
+clearInterval(timer);
+
+if (!res.destroyed) {
+  res.end();
+}
+
+}
+
+res.on("drain", () => {
+waitingForDrain = false;
+});
+
+res.on("close", () => {
+closed = true;
+clearInterval(timer);
+});
+
+res.on("error", () => {
+cleanup();
+});
+});
+
+// =====================================================
+// HEALTH
+// =====================================================
+
+app.get("/health", (req, res) => {
+res.json({
+status: "ok",
+
+channels: channels.length,
+
+current: currentChannel
+  ? {
+      id: currentChannel.id,
+      name: currentChannel.name
+    }
+  : null,
+
+playing: !!ffmpeg,
+
+restarting: !!restartTimer,
+
+generation: ffmpegGeneration,
+
+ffmpegPid: ffmpeg
+  ? ffmpeg.pid
+  : null,
+
+memory: {
+  latestFrameBytes: latestFrame
+    ? latestFrame.data.length
+    : 0,
+
+  jpegParserBytes: jpegBuffer.length,
+
+  audioBufferBytes: audioBuffer.length,
+
+  audioBufferMax: AUDIO_BUFFER_MAX
+},
+
+video: {
+  width: WIDTH,
+  height: HEIGHT,
+  fps: FPS,
+  quality: JPEG_QUALITY,
+  mode: "LATEST FRAME ONLY",
+  endpoint: "/stream"
+},
+
+audio: {
+  codec: "PCM S16LE",
+  sampleRate: AUDIO_SAMPLE_RATE,
+  channels: AUDIO_CHANNELS,
+  bits: 16,
+  chunkMs: 20,
+  endpoint: "/audio"
+}
+
+});
+});
+
+// =====================================================
+// SERVER
+// =====================================================
+
+app.listen(PORT, "0.0.0.0", async () => {
+console.log("");
+
+console.log("======================================");
+console.log("ESP32 IPTV SERVER");
+console.log("LOW LATENCY / LATEST FRAME");
+console.log("======================================");
+
+console.log("Port: ${PORT}");
+
+console.log(
+"Video: ${WIDTH}x${HEIGHT} @ ${FPS} FPS"
+);
+
+console.log("Video: MJPEG");
+
+console.log(
+"Audio: PCM ${AUDIO_SAMPLE_RATE}Hz Mono 16-bit"
+);
+
+console.log("Frame cache: 1 frame");
+console.log("Audio cache: ~200ms");
+console.log("Disk cache: OFF");
+console.log("Auto restart: ON");
+console.log("Web UI: OFF");
+
+console.log("======================================");
+
+try {
+console.log("Đang tải playlist...");
+
+const m3u = await downloadM3U(M3U_URL);
+
+channels = parseM3U(m3u);
+
+console.log("Tổng kênh:", channels.length);
+
+console.log("");
+
+console.log("======================================");
+console.log("SERVER READY");
+
+console.log("Channels:", channels.length);
+console.log("Chưa phát kênh nào.");
+
+console.log(
+  `API: http://SERVER:${PORT}/api/channels`
+);
+
+console.log(
+  `Select: http://SERVER:${PORT}/api/select/ID`
+);
+
+console.log(
+  `Video: http://SERVER:${PORT}/stream`
+);
+
+console.log(
+  `Audio: http://SERVER:${PORT}/audio`
+);
+
+console.log(
+  `Health: http://SERVER:${PORT}/health`
+);
+
+console.log("======================================");
+
+} catch (error) {
+console.error("LỖI:", error.message);
+}
 });

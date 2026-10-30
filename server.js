@@ -22,7 +22,7 @@ const M3U_URL =
 const WIDTH = 320;
 const HEIGHT = 240;
 
-const FPS = 14;
+const FPS = 10;
 
 const DELAY_SECONDS = 1;
 const BUFFER_SECONDS = 12;

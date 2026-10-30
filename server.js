@@ -33,9 +33,12 @@ const MAX_BUFFER_FRAMES =
 const HLS_TIME = 2;
 const HLS_LIST = 8;
 
-// kiểm tra stream
 const CHECK_TIMEOUT = 7000;
 const CHECK_CONCURRENCY = 6;
+
+// Giới hạn nguồn tối đa 720p
+const MAX_SOURCE_WIDTH = 1280;
+const MAX_SOURCE_HEIGHT = 720;
 
 // =====================================================
 // HLS
@@ -129,6 +132,173 @@ function downloadM3U(url) {
 }
 
 // =====================================================
+// CHỌN STREAM <= 720P
+// =====================================================
+
+async function select720pOrLower(url) {
+
+  if (
+    !url ||
+    !/^https?:/i.test(url)
+  ) {
+    return url;
+  }
+
+  if (
+    !/\.m3u8(?:$|\?)/i.test(url)
+  ) {
+    return url;
+  }
+
+  try {
+
+    const text =
+      await downloadM3U(url);
+
+    // Không phải master playlist
+    if (
+      !/#EXT-X-STREAM-INF/i.test(text)
+    ) {
+      return url;
+    }
+
+    const lines =
+      text
+        .split(/\r?\n/)
+        .map(x => x.trim());
+
+    const variants = [];
+
+    for (
+      let i = 0;
+      i < lines.length;
+      i++
+    ) {
+
+      const line =
+        lines[i];
+
+      if (
+        !line.startsWith(
+          "#EXT-X-STREAM-INF"
+        )
+      ) {
+        continue;
+      }
+
+      const resolution =
+        line.match(
+          /RESOLUTION=(\d+)x(\d+)/i
+        );
+
+      if (!resolution) {
+        continue;
+      }
+
+      const width =
+        Number(
+          resolution[1]
+        );
+
+      const height =
+        Number(
+          resolution[2]
+        );
+
+      let j =
+        i + 1;
+
+      while (
+        j < lines.length &&
+        (
+          !lines[j] ||
+          lines[j].startsWith("#")
+        )
+      ) {
+        j++;
+      }
+
+      if (
+        j >= lines.length
+      ) {
+        continue;
+      }
+
+      let variantUrl;
+
+      try {
+
+        variantUrl =
+          new URL(
+            lines[j],
+            url
+          ).toString();
+
+      } catch {
+
+        variantUrl =
+          lines[j];
+      }
+
+      // Chỉ lấy <= 1280x720
+      if (
+        width <= MAX_SOURCE_WIDTH &&
+        height <= MAX_SOURCE_HEIGHT
+      ) {
+
+        variants.push({
+          url: variantUrl,
+          width,
+          height
+        });
+      }
+    }
+
+    // Không có nguồn <=720p
+    if (
+      variants.length === 0
+    ) {
+
+      console.log(
+        "Không tìm thấy variant <=720p:",
+        url
+      );
+
+      return url;
+    }
+
+    // Chọn độ phân giải cao nhất trong nhóm <=720p
+    variants.sort(
+      (a, b) =>
+        (b.width * b.height) -
+        (a.width * a.height)
+    );
+
+    const selected =
+      variants[0];
+
+    console.log(
+      `Nguồn được chọn: ${selected.width}x${selected.height}`
+    );
+
+    console.log(
+      selected.url
+    );
+
+    return selected.url;
+
+  } catch (error) {
+
+    console.log(
+      "Lỗi chọn nguồn 720p:",
+      error.message
+    );
+
+    return url;
+  }
+}
+
+// =====================================================
 // PARSE M3U
 // =====================================================
 
@@ -148,7 +318,8 @@ function parseM3U(text) {
     i++
   ) {
 
-    const line = lines[i];
+    const line =
+      lines[i];
 
     if (
       !line.startsWith("#EXTINF")
@@ -203,7 +374,8 @@ function parseM3U(text) {
         !lines[j].startsWith("#")
       ) {
 
-        url = lines[j];
+        url =
+          lines[j];
 
         break;
       }
@@ -220,20 +392,12 @@ function parseM3U(text) {
         `Channel ${result.length + 1}`;
     }
 
-    // =============================================
-    // Bỏ các kênh đã được đánh dấu Geo-blocked
-    // =============================================
-
     if (
       line.includes("[Geo-blocked]") ||
       name.includes("[Geo-blocked]")
     ) {
       continue;
     }
-
-    // =============================================
-    // Bỏ DRM / DASH
-    // =============================================
 
     if (
       url.includes(".mpd")
@@ -336,10 +500,6 @@ function checkStream(url) {
           const status =
             response.statusCode || 0;
 
-          // =====================================
-          // CHẮC CHẮN LỖI
-          // =====================================
-
           if (
             status === 401 ||
             status === 403 ||
@@ -359,10 +519,6 @@ function checkStream(url) {
             return;
           }
 
-          // =====================================
-          // 5xx
-          // =====================================
-
           if (
             status >= 500
           ) {
@@ -379,10 +535,6 @@ function checkStream(url) {
             return;
           }
 
-          // =====================================
-          // Redirect
-          // =====================================
-
           if (
             status >= 300 &&
             status < 400
@@ -398,10 +550,6 @@ function checkStream(url) {
 
             return;
           }
-
-          // =====================================
-          // 200 / 206
-          // =====================================
 
           if (
             status === 200 ||
@@ -732,6 +880,7 @@ function stopAudioFFmpeg() {
   } catch {}
 
   ffmpegAudio = null;
+
   audioQueue.length = 0;
   audioQueueBytes = 0;
 }
@@ -774,11 +923,14 @@ function queueAudioChunk(chunk) {
 // START AUDIO FFMPEG
 // =====================================================
 
-function startAudioFFmpeg(channel) {
+function startAudioFFmpeg(
+  channel,
+  sourceUrl
+) {
 
   if (
     !channel ||
-    !channel.url
+    !sourceUrl
   ) {
     return;
   }
@@ -790,45 +942,46 @@ function startAudioFFmpeg(channel) {
 
   stopAudioFFmpeg();
 
-  ffmpegAudio = spawn(
-    "ffmpeg",
-    [
-      "-hide_banner",
-      "-loglevel",
-      "warning",
+  ffmpegAudio =
+    spawn(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
 
-      "-reconnect",
-      "1",
+        "-reconnect",
+        "1",
 
-      "-reconnect_streamed",
-      "1",
+        "-reconnect_streamed",
+        "1",
 
-      "-reconnect_delay_max",
-      "5",
+        "-reconnect_delay_max",
+        "5",
 
-      "-fflags",
-      "nobuffer",
+        "-fflags",
+        "nobuffer",
 
-      "-i",
-      channel.url,
+        "-i",
+        sourceUrl,
 
-      "-vn",
+        "-vn",
 
-      "-ac",
-      "1",
+        "-ac",
+        "1",
 
-      "-ar",
-      "44100",
+        "-ar",
+        "44100",
 
-      "-c:a",
-      "pcm_s16le",
+        "-c:a",
+        "pcm_s16le",
 
-      "-f",
-      "s16le",
+        "-f",
+        "s16le",
 
-      "pipe:1"
-    ]
-  );
+        "pipe:1"
+      ]
+    );
 
   ffmpegAudio.stderr.on(
     "data",
@@ -885,11 +1038,14 @@ function startAudioFFmpeg(channel) {
           if (
             generation ===
               ffmpegAudioGeneration &&
-            currentChannel
+            currentChannel ===
+              channel
           ) {
 
             startAudioFFmpeg(
-              currentChannel
+              channel,
+              channel.playUrl ||
+                channel.url
             );
           }
 
@@ -904,7 +1060,7 @@ function startAudioFFmpeg(channel) {
 // START FFMPEG
 // =====================================================
 
-function startFFmpeg(channel) {
+async function startFFmpeg(channel) {
 
   ffmpegGeneration++;
 
@@ -922,6 +1078,7 @@ function startFFmpeg(channel) {
   );
 
   console.log(
+    "Nguồn gốc:",
     channel.url
   );
 
@@ -939,6 +1096,32 @@ function startFFmpeg(channel) {
   jpegBuffer =
     Buffer.alloc(0);
 
+  // =========================================
+  // CHỌN NGUỒN <=720P
+  // =========================================
+
+  const sourceUrl =
+    await select720pOrLower(
+      channel.url
+    );
+
+  // Nếu người dùng đã chuyển kênh
+  // trong lúc đang tìm variant
+  if (
+    generation !==
+    ffmpegGeneration
+  ) {
+    return;
+  }
+
+  channel.playUrl =
+    sourceUrl;
+
+  console.log(
+    "Nguồn FFmpeg:",
+    sourceUrl
+  );
+
   const playlist =
     path.join(
       HLS_DIR,
@@ -951,99 +1134,105 @@ function startFFmpeg(channel) {
       "seg-%05d.ts"
     );
 
-  ffmpeg = spawn(
-    "ffmpeg",
-    [
+  ffmpeg =
+    spawn(
+      "ffmpeg",
+      [
 
-      "-hide_banner",
+        "-hide_banner",
 
-      "-loglevel",
-      "warning",
+        "-loglevel",
+        "warning",
 
-      "-reconnect",
-      "1",
+        "-reconnect",
+        "1",
 
-      "-reconnect_streamed",
-      "1",
+        "-reconnect_streamed",
+        "1",
 
-      "-reconnect_delay_max",
-      "5",
+        "-reconnect_delay_max",
+        "5",
 
-      "-fflags",
-      "nobuffer",
+        "-fflags",
+        "nobuffer",
 
-      "-i",
-      channel.url,
+        "-i",
+        sourceUrl,
 
-      // =========================================
-      // HLS
-      // =========================================
+        // =========================================
+        // HLS
+        // =========================================
 
-      "-map",
-      "0:v:0",
+        "-map",
+        "0:v:0",
 
-      "-map",
-      "0:a:0?",
+        "-map",
+        "0:a:0?",
 
-      "-c:v",
-      "copy",
+        "-c:v",
+        "copy",
 
-      "-c:a",
-      "aac",
+        "-c:a",
+        "aac",
 
-      "-b:a",
-      "96k",
+        "-b:a",
+        "96k",
 
-      "-f",
-      "hls",
+        "-f",
+        "hls",
 
-      "-hls_time",
-      String(HLS_TIME),
+        "-hls_time",
+        String(HLS_TIME),
 
-      "-hls_list_size",
-      String(HLS_LIST),
+        "-hls_list_size",
+        String(HLS_LIST),
 
-      "-hls_delete_threshold",
-      "4",
+        "-hls_delete_threshold",
+        "4",
 
-      "-hls_flags",
-      "delete_segments+append_list+independent_segments",
+        "-hls_flags",
+        "delete_segments+append_list+independent_segments",
 
-      "-hls_segment_filename",
-      segment,
+        "-hls_segment_filename",
+        segment,
 
-      playlist,
+        playlist,
 
-      // =========================================
-      // MJPEG
-      // =========================================
+        // =========================================
+        // MJPEG
+        // =========================================
 
-      "-map",
-      "0:v:0",
+        "-map",
+        "0:v:0",
 
-      "-an",
+        "-an",
 
-      "-vf",
-      `fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+        "-vf",
+        `fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
 
-      "-c:v",
-      "mjpeg",
+        "-c:v",
+        "mjpeg",
 
-      "-q:v",
-      "10",
+        "-q:v",
+        "10",
 
-      "-fps_mode",
-      "cfr",
+        "-fps_mode",
+        "cfr",
 
-      "-f",
-      "image2pipe",
+        "-f",
+        "image2pipe",
 
-      "pipe:1"
-    ]
-  );
+        "pipe:1"
+      ]
+    );
+
+  // =========================================
+  // AUDIO DÙNG CÙNG SOURCE <=720P
+  // =========================================
 
   startAudioFFmpeg(
-    channel
+    channel,
+    sourceUrl
   );
 
   // =========================================
@@ -1212,7 +1401,8 @@ function startFFmpeg(channel) {
           if (
             generation ===
               ffmpegGeneration &&
-            currentChannel
+            currentChannel ===
+              channel
           ) {
 
             startFFmpeg(
@@ -1665,9 +1855,21 @@ app.get(
                 currentChannel.id,
 
               name:
-                currentChannel.name
+                currentChannel.name,
+
+              source:
+                currentChannel.playUrl ||
+                currentChannel.url
             }
           : null,
+
+      sourceLimit: {
+        width:
+          MAX_SOURCE_WIDTH,
+
+        height:
+          MAX_SOURCE_HEIGHT
+      },
 
       mjpeg: {
 
@@ -1827,7 +2029,7 @@ placeholder="🔎 Tìm VTV, HTV, SCTV..."
 <h3>ESP32 MJPEG</h3>
 
 <div class="info">
-320 × 240 — 10 FPS — delay khoảng 10 giây
+320 × 240 — 10 FPS — nguồn tối đa 720p
 </div>
 
 <img
@@ -2144,10 +2346,6 @@ app.listen(
         "kênh"
       );
 
-      // =========================================
-      // KIỂM TRA URL
-      // =========================================
-
       channels =
         await checkChannels(
           allChannels
@@ -2185,6 +2383,11 @@ app.listen(
       console.log(
         "Kênh khả dụng:",
         channels.length
+      );
+
+      console.log(
+        "Giới hạn nguồn:",
+        `${MAX_SOURCE_WIDTH}x${MAX_SOURCE_HEIGHT}`
       );
 
     } catch (error) {

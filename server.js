@@ -20,51 +20,56 @@ const WIDTH = 320;
 const HEIGHT = 240;
 const FPS = 10;
 
-// Frame buffer:
-// chỉ giữ vài ảnh mới nhất.
-// Không được tăng quá lớn vì sẽ tạo delay.
+// Chỉ giữ ít frame mới nhất.
+// Không tích hàng chục giây gây delay.
 const FRAME_BUFFER_SIZE = 3;
 
-// Audio buffer tối đa
+// Audio buffer
 const MAX_AUDIO_BUFFER = 256 * 1024;
 
 // HLS
 const HLS_TIME = 2;
 const HLS_LIST = 6;
 
-// Check kênh
-const CHECK_TIMEOUT = 2000;
+// CHECK
+// Đây KHÔNG phải số lượng kênh.
+// Chỉ là số kênh được check đồng thời.
 const CHECK_CONCURRENCY = 20;
+const CHECK_TIMEOUT = 2000;
+
 
 // ============================================================
 // GLOBAL
 // ============================================================
 
+// TẤT CẢ KÊNH từ M3U
 let channels = [];
+
 let currentIndex = 0;
 let currentChannel = null;
 
 // Session tăng mỗi lần đổi kênh.
-// Session cũ tuyệt đối không được ghi dữ liệu vào session mới.
+// Dùng để tuyệt đối không trộn kênh.
 let sessionId = 0;
 
-// Process của session hiện tại
+// FFmpeg hiện tại
 let videoProcess = null;
 let hlsProcess = null;
 let audioProcess = null;
 
-// Frame buffer
+// Frame buffer MJPEG
 let frameBuffer = [];
 
 // Audio buffer
 let audioQueue = [];
 let audioBytes = 0;
 
-// HTTP MJPEG clients
+// HLS thư mục hiện tại
+let currentHlsDir = null;
+
+// MJPEG clients
 const mjpegClients = new Set();
 
-// HLS directory hiện tại
-let currentHlsDir = null;
 
 // ============================================================
 // STATS
@@ -95,7 +100,7 @@ let fpsLastTime = Date.now();
 
 
 // ============================================================
-// UTILITY
+// LOG
 // ============================================================
 
 function log(...args) {
@@ -105,15 +110,9 @@ function log(...args) {
   );
 }
 
-function sleep(ms) {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
-  );
-}
-
 
 // ============================================================
-// PLAYLIST
+// LOAD M3U
 // ============================================================
 
 async function loadPlaylist() {
@@ -144,9 +143,13 @@ async function loadPlaylist() {
     const line =
       raw.trim();
 
-    if (!line) continue;
+    if (!line) {
+      continue;
+    }
 
-    if (line.startsWith("#EXTINF")) {
+    if (
+      line.startsWith("#EXTINF")
+    ) {
 
       const comma =
         line.indexOf(",");
@@ -159,19 +162,25 @@ async function loadPlaylist() {
           : "Unknown";
 
       const tvgId =
-        (line.match(
-          /tvg-id="([^"]*)"/i
-        ) || [])[1] || "";
+        (
+          line.match(
+            /tvg-id="([^"]*)"/i
+          ) || []
+        )[1] || "";
 
       const group =
-        (line.match(
-          /group-title="([^"]*)"/i
-        ) || [])[1] || "";
+        (
+          line.match(
+            /group-title="([^"]*)"/i
+          ) || []
+        )[1] || "";
 
       const logo =
-        (line.match(
-          /tvg-logo="([^"]*)"/i
-        ) || [])[1] || "";
+        (
+          line.match(
+            /tvg-logo="([^"]*)"/i
+          ) || []
+        )[1] || "";
 
       info = {
         name,
@@ -190,7 +199,13 @@ async function loadPlaylist() {
 
       result.push({
         ...info,
-        url: line
+
+        url: line,
+
+        // Mặc định chưa check
+        live: null,
+
+        error: null
       });
 
       info = null;
@@ -198,7 +213,7 @@ async function loadPlaylist() {
   }
 
   log(
-    `[M3U] ${result.length} channels found`
+    `[M3U] Total channels: ${result.length}`
   );
 
   return result;
@@ -206,23 +221,28 @@ async function loadPlaylist() {
 
 
 // ============================================================
-// FAST CHANNEL CHECK
+// CHECK ONE CHANNEL
 // ============================================================
 
 function checkChannel(channel) {
 
   return new Promise(resolve => {
 
-    let done = false;
+    let finished = false;
     let timer = null;
     let ff = null;
     let output = "";
 
-    function finish(ok) {
+    function finish(
+      ok,
+      error = null
+    ) {
 
-      if (done) return;
+      if (finished) {
+        return;
+      }
 
-      done = true;
+      finished = true;
 
       if (timer) {
         clearTimeout(timer);
@@ -234,7 +254,10 @@ function checkChannel(channel) {
         }
       } catch {}
 
-      resolve(ok);
+      resolve({
+        ok,
+        error
+      });
     }
 
     try {
@@ -252,6 +275,7 @@ function checkChannel(channel) {
           "-probesize",
           "500k",
 
+          // timeout network
           "-rw_timeout",
           "2000000",
 
@@ -271,14 +295,19 @@ function checkChannel(channel) {
           stdio: [
             "ignore",
             "pipe",
-            "ignore"
+            "pipe"
           ]
         }
       );
 
       timer =
         setTimeout(
-          () => finish(false),
+          () => {
+            finish(
+              false,
+              "timeout"
+            );
+          },
           CHECK_TIMEOUT
         );
 
@@ -294,7 +323,29 @@ function checkChannel(channel) {
               .toLowerCase()
               .includes("video")
           ) {
-            finish(true);
+
+            finish(
+              true,
+              null
+            );
+          }
+        }
+      );
+
+      ff.stderr.on(
+        "data",
+        data => {
+
+          const errorText =
+            data.toString()
+              .trim();
+
+          if (
+            errorText &&
+            !output
+          ) {
+            // Chỉ lưu để tham khảo,
+            // không kết luận chết ngay.
           }
         }
       );
@@ -303,24 +354,49 @@ function checkChannel(channel) {
         "close",
         code => {
 
-          if (done) return;
+          if (finished) {
+            return;
+          }
 
-          finish(
+          if (
             code === 0 &&
             output
               .toLowerCase()
               .includes("video")
-          );
+          ) {
+
+            finish(
+              true,
+              null
+            );
+
+          } else {
+
+            finish(
+              false,
+              `ffprobe exit ${code}`
+            );
+          }
         }
       );
 
       ff.on(
         "error",
-        () => finish(false)
+        err => {
+
+          finish(
+            false,
+            err.message
+          );
+        }
       );
 
-    } catch {
-      finish(false);
+    } catch (err) {
+
+      finish(
+        false,
+        err.message
+      );
     }
   });
 }
@@ -328,52 +404,70 @@ function checkChannel(channel) {
 
 // ============================================================
 // CHECK ALL CHANNELS
+//
+// QUAN TRỌNG:
+// - Không xóa kênh khỏi channels.
+// - channels vẫn chứa TOÀN BỘ M3U.
+// - live chỉ được cập nhật.
 // ============================================================
 
-async function checkChannels(list) {
+async function checkAllChannels() {
 
-  const alive = [];
+  log(
+    `[CHECK] Checking ALL ${channels.length} channels`
+  );
 
-  let next = 0;
+  log(
+    `[CHECK] Concurrency = ${CHECK_CONCURRENCY}`
+  );
+
+  let nextIndex = 0;
 
   async function worker() {
 
     while (true) {
 
       const index =
-        next++;
+        nextIndex++;
 
       if (
-        index >= list.length
+        index >= channels.length
       ) {
         return;
       }
 
       const channel =
-        list[index];
+        channels[index];
 
       log(
-        `[CHECK] ${index + 1}/${list.length} ${channel.name}`
+        `[CHECK] ${index + 1}/${channels.length} ${channel.name}`
       );
 
-      const ok =
-        await checkChannel(channel);
+      const result =
+        await checkChannel(
+          channel
+        );
 
-      if (ok) {
+      // Cập nhật trực tiếp vào
+      // đúng phần tử trong channels
+      channel.live =
+        result.ok;
+
+      channel.error =
+        result.ok
+          ? null
+          : result.error;
+
+      if (result.ok) {
 
         log(
           `[LIVE] ${channel.name}`
         );
 
-        alive.push({
-          ...channel,
-          originalIndex: index
-        });
-
       } else {
 
         log(
-          `[DEAD] ${channel.name}`
+          `[DEAD] ${channel.name} (${result.error})`
         );
       }
     }
@@ -386,30 +480,38 @@ async function checkChannels(list) {
     i <
     Math.min(
       CHECK_CONCURRENCY,
-      list.length
+      channels.length
     );
     i++
   ) {
-    workers.push(worker());
+
+    workers.push(
+      worker()
+    );
   }
 
-  await Promise.all(workers);
-
-  alive.sort(
-    (a, b) =>
-      a.originalIndex -
-      b.originalIndex
+  await Promise.all(
+    workers
   );
 
-  return alive;
+  const liveCount =
+    channels.filter(
+      c => c.live === true
+    ).length;
+
+  log(
+    `[CHECK] Finished: ${liveCount}/${channels.length} live`
+  );
 }
 
 
 // ============================================================
-// CREATE HLS DIRECTORY
+// HLS DIRECTORY
 // ============================================================
 
-function createHlsDirectory(id) {
+function createHlsDirectory(
+  id
+) {
 
   const dir =
     path.join(
@@ -428,13 +530,13 @@ function createHlsDirectory(id) {
 }
 
 
-// ============================================================
-// DELETE OLD HLS DIRECTORY
-// ============================================================
+function removeHlsDirectory(
+  dir
+) {
 
-function removeHlsDirectory(dir) {
-
-  if (!dir) return;
+  if (!dir) {
+    return;
+  }
 
   try {
 
@@ -454,9 +556,13 @@ function removeHlsDirectory(dir) {
 // KILL PROCESS
 // ============================================================
 
-function killProcess(proc) {
+function killProcess(
+  proc
+) {
 
-  if (!proc) return;
+  if (!proc) {
+    return;
+  }
 
   try {
     proc.kill("SIGKILL");
@@ -465,31 +571,45 @@ function killProcess(proc) {
 
 
 // ============================================================
-// STOP EVERYTHING
+// STOP CURRENT SESSION
 // ============================================================
 
 function stopCurrentSession() {
 
   log(
-    "[SESSION] Stopping old session"
+    "[SESSION] Stop old session"
   );
 
-  killProcess(videoProcess);
-  killProcess(hlsProcess);
-  killProcess(audioProcess);
+  killProcess(
+    videoProcess
+  );
+
+  killProcess(
+    hlsProcess
+  );
+
+  killProcess(
+    audioProcess
+  );
 
   videoProcess = null;
   hlsProcess = null;
   audioProcess = null;
 
+  // Xóa toàn bộ frame cũ
   frameBuffer = [];
 
+  // Xóa toàn bộ audio cũ
   audioQueue = [];
   audioBytes = 0;
 
-  stats.audio.running = false;
-  stats.audio.bytes = 0;
+  stats.audio.running =
+    false;
 
+  stats.audio.bytes =
+    0;
+
+  // Xóa HLS cũ
   if (currentHlsDir) {
 
     removeHlsDirectory(
@@ -502,7 +622,7 @@ function stopCurrentSession() {
 
 
 // ============================================================
-// PARSE FFMPEG STATUS
+// FFMPEG STATS
 // ============================================================
 
 function parseFFmpegStats(
@@ -525,39 +645,55 @@ function parseFFmpegStats(
       /frame=\s*([0-9]+)/
     );
 
-  if (type === "video") {
+  if (
+    type === "video"
+  ) {
 
     if (fps) {
       stats.mjpeg.fps =
-        Number(fps[1]);
+        Number(
+          fps[1]
+        );
     }
 
     if (speed) {
       stats.mjpeg.speed =
-        Number(speed[1]);
+        Number(
+          speed[1]
+        );
     }
 
     if (frame) {
       stats.mjpeg.frame =
-        Number(frame[1]);
+        Number(
+          frame[1]
+        );
     }
   }
 
-  if (type === "hls") {
+  if (
+    type === "hls"
+  ) {
 
     if (fps) {
       stats.hls.fps =
-        Number(fps[1]);
+        Number(
+          fps[1]
+        );
     }
 
     if (speed) {
       stats.hls.speed =
-        Number(speed[1]);
+        Number(
+          speed[1]
+        );
     }
 
     if (frame) {
       stats.hls.frame =
-        Number(frame[1]);
+        Number(
+          frame[1]
+        );
     }
   }
 }
@@ -575,9 +711,12 @@ function updateFPS() {
     Date.now();
 
   const elapsed =
-    now - fpsLastTime;
+    now -
+    fpsLastTime;
 
-  if (elapsed >= 1000) {
+  if (
+    elapsed >= 1000
+  ) {
 
     stats.mjpeg.fps =
       fpsCounter /
@@ -585,13 +724,14 @@ function updateFPS() {
 
     fpsCounter = 0;
 
-    fpsLastTime = now;
+    fpsLastTime =
+      now;
   }
 }
 
 
 // ============================================================
-// START VIDEO / MJPEG
+// START VIDEO
 // ============================================================
 
 function startVideo(
@@ -600,13 +740,14 @@ function startVideo(
 ) {
 
   log(
-    `[VIDEO] Start session ${mySession}: ${channel.name}`
+    `[VIDEO] Session ${mySession}: ${channel.name}`
   );
 
   frameBuffer = [];
 
   fpsCounter = 0;
-  fpsLastTime = Date.now();
+  fpsLastTime =
+    Date.now();
 
   const ff =
     spawn(
@@ -616,10 +757,7 @@ function startVideo(
         "-loglevel",
         "warning",
 
-        // ====================================================
-        // LOW LATENCY INPUT
-        // ====================================================
-
+        // LOW LATENCY
         "-fflags",
         "nobuffer",
 
@@ -641,19 +779,13 @@ function startVideo(
         "-i",
         channel.url,
 
-        // ====================================================
         // VIDEO ONLY
-        // ====================================================
-
         "-map",
         "0:v:0",
 
         "-an",
 
-        // ====================================================
-        // SCALE TO ESP32 SIZE
-        // ====================================================
-
+        // 320x240 10 FPS
         "-vf",
         [
           `fps=${FPS}`,
@@ -662,10 +794,6 @@ function startVideo(
 
           `pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`
         ].join(","),
-
-        // ====================================================
-        // JPEG
-        // ====================================================
 
         "-c:v",
         "mjpeg",
@@ -693,7 +821,8 @@ function startVideo(
       }
     );
 
-  videoProcess = ff;
+  videoProcess =
+    ff;
 
   let buffer =
     Buffer.alloc(0);
@@ -702,10 +831,8 @@ function startVideo(
     "data",
     chunk => {
 
-      // ------------------------------------------------------
-      // SESSION PROTECTION
-      // ------------------------------------------------------
-
+      // Không nhận dữ liệu
+      // từ session cũ
       if (
         mySession !== sessionId
       ) {
@@ -728,13 +855,15 @@ function startVideo(
             ])
           );
 
-        if (start < 0) {
+        if (
+          start < 0
+        ) {
 
-          // Không giữ buffer vô hạn
           if (
             buffer.length >
             512 * 1024
           ) {
+
             buffer =
               buffer.slice(
                 -32 * 1024
@@ -753,11 +882,18 @@ function startVideo(
             start + 2
           );
 
-        if (end < 0) {
+        if (
+          end < 0
+        ) {
 
-          if (start > 0) {
+          if (
+            start > 0
+          ) {
+
             buffer =
-              buffer.slice(start);
+              buffer.slice(
+                start
+              );
           }
 
           break;
@@ -775,11 +911,9 @@ function startVideo(
           );
 
         buffer =
-          buffer.slice(endPos);
-
-        // ----------------------------------------------------
-        // SESSION PROTECTION
-        // ----------------------------------------------------
+          buffer.slice(
+            endPos
+          );
 
         if (
           mySession !== sessionId
@@ -787,13 +921,9 @@ function startVideo(
           return;
         }
 
-        // ----------------------------------------------------
-        // FRAME BUFFER
-        //
-        // Không gửi ảnh trực tiếp.
-        // Đưa ảnh vào buffer nhỏ rồi bộ phát
-        // lấy ảnh ổn định ở 10 FPS.
-        // ----------------------------------------------------
+        // ====================================================
+        // FRAME BUFFER NHỎ
+        // ====================================================
 
         frameBuffer.push({
           data: jpeg,
@@ -804,6 +934,7 @@ function startVideo(
           frameBuffer.length >
           FRAME_BUFFER_SIZE
         ) {
+
           frameBuffer.shift();
         }
 
@@ -824,11 +955,8 @@ function startVideo(
         return;
       }
 
-      const text =
-        data.toString();
-
       parseFFmpegStats(
-        text,
+        data.toString(),
         "video"
       );
     }
@@ -839,7 +967,7 @@ function startVideo(
     code => {
 
       log(
-        `[VIDEO] Session ${mySession} stopped code=${code}`
+        `[VIDEO] Session ${mySession} stopped: ${code}`
       );
 
       if (
@@ -851,32 +979,33 @@ function startVideo(
       if (
         videoProcess === ff
       ) {
-        videoProcess = null;
+        videoProcess =
+          null;
       }
 
-      // ------------------------------------------------------
-      // Chỉ session hiện tại mới được restart
-      // ------------------------------------------------------
-
+      // Chỉ restart session hiện tại
       if (
         currentChannel &&
         mySession === sessionId
       ) {
 
-        setTimeout(() => {
+        setTimeout(
+          () => {
 
-          if (
-            mySession === sessionId &&
-            currentChannel
-          ) {
+            if (
+              mySession === sessionId &&
+              currentChannel
+            ) {
 
-            startVideo(
-              currentChannel,
-              mySession
-            );
-          }
+              startVideo(
+                currentChannel,
+                mySession
+              );
+            }
 
-        }, 1000);
+          },
+          1000
+        );
       }
     }
   );
@@ -892,7 +1021,7 @@ function startVideo(
       }
 
       log(
-        `[VIDEO] error: ${err.message}`
+        `[VIDEO] Error: ${err.message}`
       );
     }
   );
@@ -910,7 +1039,7 @@ function startHLS(
 ) {
 
   log(
-    `[HLS] Start session ${mySession}: ${channel.name}`
+    `[HLS] Session ${mySession}: ${channel.name}`
   );
 
   const playlist =
@@ -1000,7 +1129,8 @@ function startHLS(
       }
     );
 
-  hlsProcess = ff;
+  hlsProcess =
+    ff;
 
   ff.stderr.on(
     "data",
@@ -1024,7 +1154,7 @@ function startHLS(
     code => {
 
       log(
-        `[HLS] Session ${mySession} stopped code=${code}`
+        `[HLS] Session ${mySession} stopped: ${code}`
       );
 
       if (
@@ -1036,7 +1166,8 @@ function startHLS(
       if (
         hlsProcess === ff
       ) {
-        hlsProcess = null;
+        hlsProcess =
+          null;
       }
 
       if (
@@ -1044,20 +1175,23 @@ function startHLS(
         mySession === sessionId
       ) {
 
-        setTimeout(() => {
+        setTimeout(
+          () => {
 
-          if (
-            mySession === sessionId
-          ) {
+            if (
+              mySession === sessionId
+            ) {
 
-            startHLS(
-              currentChannel,
-              mySession,
-              hlsDir
-            );
-          }
+              startHLS(
+                currentChannel,
+                mySession,
+                hlsDir
+              );
+            }
 
-        }, 1000);
+          },
+          1000
+        );
       }
     }
   );
@@ -1073,7 +1207,7 @@ function startHLS(
       }
 
       log(
-        `[HLS] error: ${err.message}`
+        `[HLS] Error: ${err.message}`
       );
     }
   );
@@ -1090,11 +1224,14 @@ function startAudio(
 ) {
 
   log(
-    `[AUDIO] Start session ${mySession}: ${channel.name}`
+    `[AUDIO] Session ${mySession}: ${channel.name}`
   );
 
   audioQueue = [];
   audioBytes = 0;
+
+  stats.audio.bytes =
+    0;
 
   const ff =
     spawn(
@@ -1147,9 +1284,11 @@ function startAudio(
       }
     );
 
-  audioProcess = ff;
+  audioProcess =
+    ff;
 
-  stats.audio.running = true;
+  stats.audio.running =
+    true;
 
   ff.stdout.on(
     "data",
@@ -1164,14 +1303,12 @@ function startAudio(
       const data =
         Buffer.from(chunk);
 
-      audioQueue.push(data);
+      audioQueue.push(
+        data
+      );
 
       audioBytes +=
         data.length;
-
-      // ------------------------------------------------------
-      // Không cho audio buffer tích quá nhiều
-      // ------------------------------------------------------
 
       while (
         audioBytes >
@@ -1181,7 +1318,9 @@ function startAudio(
         const old =
           audioQueue.shift();
 
-        if (!old) break;
+        if (!old) {
+          break;
+        }
 
         audioBytes -=
           old.length;
@@ -1197,7 +1336,7 @@ function startAudio(
     code => {
 
       log(
-        `[AUDIO] Session ${mySession} stopped code=${code}`
+        `[AUDIO] Session ${mySession} stopped: ${code}`
       );
 
       if (
@@ -1212,7 +1351,8 @@ function startAudio(
       if (
         audioProcess === ff
       ) {
-        audioProcess = null;
+        audioProcess =
+          null;
       }
 
       if (
@@ -1220,19 +1360,22 @@ function startAudio(
         mySession === sessionId
       ) {
 
-        setTimeout(() => {
+        setTimeout(
+          () => {
 
-          if (
-            mySession === sessionId
-          ) {
+            if (
+              mySession === sessionId
+            ) {
 
-            startAudio(
-              currentChannel,
-              mySession
-            );
-          }
+              startAudio(
+                currentChannel,
+                mySession
+              );
+            }
 
-        }, 1000);
+          },
+          1000
+        );
       }
     }
   );
@@ -1248,7 +1391,7 @@ function startAudio(
       }
 
       log(
-        `[AUDIO] error: ${err.message}`
+        `[AUDIO] Error: ${err.message}`
       );
     }
   );
@@ -1259,23 +1402,25 @@ function startAudio(
 // START CHANNEL
 // ============================================================
 
-function startChannel(index) {
+function startChannel(
+  index
+) {
 
   if (
     !channels.length
   ) {
-    return;
+    return false;
   }
 
   if (
     index < 0 ||
     index >= channels.length
   ) {
-    index = 0;
+    return false;
   }
 
   // ----------------------------------------------------------
-  // TẠO SESSION MỚI TRƯỚC
+  // SESSION MỚI
   // ----------------------------------------------------------
 
   sessionId++;
@@ -1283,31 +1428,40 @@ function startChannel(index) {
   const mySession =
     sessionId;
 
+  // ----------------------------------------------------------
+  // DỪNG SESSION CŨ
+  // ----------------------------------------------------------
+
+  stopCurrentSession();
+
+  currentIndex =
+    index;
+
+  currentChannel =
+    channels[index];
+
   log(
     "================================================"
   );
 
   log(
-    `[SESSION] NEW SESSION ${mySession}`
+    `[SESSION] ${mySession}`
   );
-
-  // ----------------------------------------------------------
-  // STOP SESSION CŨ
-  // ----------------------------------------------------------
-
-  stopCurrentSession();
-
-  currentIndex = index;
-
-  currentChannel =
-    channels[index];
 
   log(
     `[CHANNEL] ${currentChannel.name}`
   );
 
   log(
+    `[LIVE] ${currentChannel.live}`
+  );
+
+  log(
     `[URL] ${currentChannel.url}`
+  );
+
+  log(
+    "================================================"
   );
 
   // ----------------------------------------------------------
@@ -1320,7 +1474,7 @@ function startChannel(index) {
     );
 
   // ----------------------------------------------------------
-  // START 3 PIPE
+  // START
   // ----------------------------------------------------------
 
   startVideo(
@@ -1339,13 +1493,7 @@ function startChannel(index) {
     mySession
   );
 
-  log(
-    `[SESSION] ${mySession} started`
-  );
-
-  log(
-    "================================================"
-  );
+  return true;
 }
 
 
@@ -1358,14 +1506,21 @@ function nextChannel() {
   if (
     !channels.length
   ) {
-    return;
+    return false;
   }
 
-  const index =
-    (currentIndex + 1) %
-    channels.length;
+  let index =
+    currentIndex + 1;
 
-  startChannel(index);
+  if (
+    index >= channels.length
+  ) {
+    index = 0;
+  }
+
+  return startChannel(
+    index
+  );
 }
 
 
@@ -1398,16 +1553,24 @@ app.get(
     );
 
     const client = {
+
       res,
-      session: sessionId,
-      lastFrame: null
+
+      session:
+        sessionId,
+
+      lastFrame:
+        null
     };
 
-    mjpegClients.add(client);
+    mjpegClients.add(
+      client
+    );
 
     req.on(
       "close",
       () => {
+
         mjpegClients.delete(
           client
         );
@@ -1418,103 +1581,105 @@ app.get(
 
 
 // ============================================================
-// FRAME BROADCASTER
+// STABLE MJPEG OUTPUT
 //
-// Không gửi JPEG ngay khi FFmpeg vừa decode.
-// Cứ đúng 10 FPS mới lấy 1 frame từ buffer.
+// Bộ phát cố định 10 FPS.
+// Không lấy trực tiếp frame từ pipe.
+// Luôn lấy frame MỚI NHẤT.
 // ============================================================
 
-setInterval(() => {
-
-  if (
-    !frameBuffer.length
-  ) {
-    return;
-  }
-
-  const frame =
-    frameBuffer[
-      frameBuffer.length - 1
-    ];
-
-  if (!frame) {
-    return;
-  }
-
-  const now =
-    Date.now();
-
-  for (
-    const client of mjpegClients
-  ) {
-
-    // --------------------------------------------------------
-    // Client cũ của session cũ
-    // --------------------------------------------------------
+setInterval(
+  () => {
 
     if (
-      client.session !== sessionId
+      !frameBuffer.length
+    ) {
+      return;
+    }
+
+    const frame =
+      frameBuffer[
+        frameBuffer.length - 1
+      ];
+
+    if (!frame) {
+      return;
+    }
+
+    for (
+      const client of mjpegClients
     ) {
 
-      client.session =
-        sessionId;
+      // ------------------------------------------------------
+      // Khi đổi kênh:
+      // reset client sang session mới.
+      // ------------------------------------------------------
 
-      client.lastFrame =
-        null;
+      if (
+        client.session !==
+        sessionId
+      ) {
 
-      continue;
+        client.session =
+          sessionId;
+
+        client.lastFrame =
+          null;
+
+        continue;
+      }
+
+      // ------------------------------------------------------
+      // Không gửi cùng frame 2 lần
+      // ------------------------------------------------------
+
+      if (
+        client.lastFrame ===
+        frame.time
+      ) {
+        continue;
+      }
+
+      try {
+
+        client.res.write(
+          "--frame\r\n"
+        );
+
+        client.res.write(
+          "Content-Type: image/jpeg\r\n"
+        );
+
+        client.res.write(
+          "Content-Length: " +
+          frame.data.length +
+          "\r\n\r\n"
+        );
+
+        client.res.write(
+          frame.data
+        );
+
+        client.res.write(
+          "\r\n"
+        );
+
+        client.lastFrame =
+          frame.time;
+
+      } catch {
+
+        mjpegClients.delete(
+          client
+        );
+      }
     }
 
-    // --------------------------------------------------------
-    // Không gửi cùng một frame 2 lần
-    // --------------------------------------------------------
-
-    if (
-      client.lastFrame ===
-      frame.time
-    ) {
-      continue;
-    }
-
-    try {
-
-      const res =
-        client.res;
-
-      res.write(
-        "--frame\r\n"
-      );
-
-      res.write(
-        "Content-Type: image/jpeg\r\n"
-      );
-
-      res.write(
-        "Content-Length: " +
-        frame.data.length +
-        "\r\n\r\n"
-      );
-
-      res.write(
-        frame.data
-      );
-
-      res.write(
-        "\r\n"
-      );
-
-      client.lastFrame =
-        frame.time;
-
-    } catch {
-
-      mjpegClients.delete(
-        client
-      );
-    }
-  }
-
-}, Math.round(1000 / FPS));
+  },
+  Math.round(
+    1000 / FPS
+  )
+);
 
 
 // ============================================================
@@ -1528,6 +1693,7 @@ app.get(
     if (
       !currentHlsDir
     ) {
+
       return res
         .status(503)
         .send(
@@ -1544,12 +1710,13 @@ app.get(
     if (
       !fs.existsSync(file)
     ) {
+
       return res
         .status(503)
         .send(
           "HLS not ready"
         );
-    }
+        }
 
     try {
 
@@ -1558,10 +1725,6 @@ app.get(
           file,
           "utf8"
         );
-
-      // ------------------------------------------------------
-      // Đổi segment thành URL của server
-      // ------------------------------------------------------
 
       data =
         data.replace(
@@ -1579,7 +1742,9 @@ app.get(
         "no-cache, no-store"
       );
 
-      res.send(data);
+      res.send(
+        data
+      );
 
     } catch {
 
@@ -1604,6 +1769,7 @@ app.get(
     if (
       !currentHlsDir
     ) {
+
       return res
         .status(404)
         .send(
@@ -1625,6 +1791,7 @@ app.get(
     if (
       !fs.existsSync(file)
     ) {
+
       return res
         .status(404)
         .send(
@@ -1650,7 +1817,7 @@ app.get(
 
 
 // ============================================================
-// CHANNEL API
+// ALL CHANNELS JSON
 // ============================================================
 
 app.get(
@@ -1659,14 +1826,71 @@ app.get(
 
     res.json(
       channels.map(
-        (c, i) => ({
-          index: i,
-          name: c.name,
-          group: c.group,
-          logo: c.logo
+        (channel, index) => ({
+
+          index,
+
+          name:
+            channel.name,
+
+          group:
+            channel.group,
+
+          logo:
+            channel.logo,
+
+          tvgId:
+            channel.tvgId,
+
+          url:
+            channel.url,
+
+          // null = chưa check
+          // true = sống
+          // false = chết
+          live:
+            channel.live,
+
+          error:
+            channel.error
+
         })
       )
     );
+  }
+);
+
+
+// ============================================================
+// CURRENT CHANNEL
+// ============================================================
+
+app.get(
+  "/api/current",
+  (req, res) => {
+
+    res.json({
+
+      session:
+        sessionId,
+
+      index:
+        currentIndex,
+
+      channel:
+        currentChannel
+          ? {
+              name:
+                currentChannel.name,
+
+              url:
+                currentChannel.url,
+
+              live:
+                currentChannel.live
+            }
+          : null
+    });
   }
 );
 
@@ -1694,18 +1918,40 @@ app.post(
         .status(400)
         .json({
           ok: false,
+
           error:
             "Invalid channel"
         });
     }
 
-    startChannel(index);
+    const ok =
+      startChannel(
+        index
+      );
+
+    if (!ok) {
+
+      return res
+        .status(500)
+        .json({
+          ok: false
+        });
+    }
 
     res.json({
+
       ok: true,
-      session: sessionId,
+
+      session:
+        sessionId,
+
+      index,
+
       channel:
-        currentChannel.name
+        currentChannel.name,
+
+      live:
+        currentChannel.live
     });
   }
 );
@@ -1719,11 +1965,19 @@ app.post(
   "/api/next",
   (req, res) => {
 
-    nextChannel();
+    const ok =
+      nextChannel();
 
     res.json({
-      ok: true,
-      session: sessionId,
+
+      ok,
+
+      session:
+        sessionId,
+
+      index:
+        currentIndex,
+
       channel:
         currentChannel
           ? currentChannel.name
@@ -1741,6 +1995,21 @@ app.get(
   "/health",
   (req, res) => {
 
+    const liveCount =
+      channels.filter(
+        c => c.live === true
+      ).length;
+
+    const deadCount =
+      channels.filter(
+        c => c.live === false
+      ).length;
+
+    const unchecked =
+      channels.filter(
+        c => c.live === null
+      ).length;
+
     res.json({
 
       ok: true,
@@ -1753,10 +2022,8 @@ app.get(
           ? currentChannel.name
           : null,
 
-      url:
-        currentChannel
-          ? currentChannel.url
-          : null,
+      index:
+        currentIndex,
 
       resolution:
         `${WIDTH}x${HEIGHT}`,
@@ -1771,7 +2038,7 @@ app.get(
           fps:
             stats.mjpeg.fps,
 
-          frames:
+          totalFrames:
             stats.mjpeg.frames,
 
           frame:
@@ -1784,7 +2051,8 @@ app.get(
             frameBuffer.length,
 
           bufferSeconds:
-            frameBuffer.length / FPS
+            frameBuffer.length /
+            FPS
         },
 
         hls: {
@@ -1820,6 +2088,15 @@ app.get(
         total:
           channels.length,
 
+        live:
+          liveCount,
+
+        dead:
+          deadCount,
+
+        unchecked:
+          unchecked,
+
         current:
           currentIndex
       }
@@ -1829,7 +2106,7 @@ app.get(
 
 
 // ============================================================
-// WEB UI
+// WEB
 // ============================================================
 
 app.get(
@@ -1838,6 +2115,7 @@ app.get(
 
     res.send(`
 <!DOCTYPE html>
+
 <html lang="vi">
 
 <head>
@@ -1849,14 +2127,14 @@ app.get(
   content="width=device-width,initial-scale=1"
 >
 
-<title>IPTV</title>
+<title>IPTV Server</title>
 
 <style>
 
 body {
   margin: 0;
   background: #111;
-  color: white;
+  color: #fff;
   font-family: Arial;
 }
 
@@ -1875,15 +2153,13 @@ button {
 
 video {
   width: 100%;
-  max-height: 500px;
-  background: black;
+  background: #000;
 }
 
 #mjpeg {
   width: 320px;
   height: 240px;
-  background: black;
-  image-rendering: auto;
+  background: #000;
 }
 
 pre {
@@ -1898,7 +2174,7 @@ pre {
 
 <div class="container">
 
-<h2>IPTV Server</h2>
+<h2>IPTV</h2>
 
 <select id="channels">
 </select>
@@ -1939,13 +2215,13 @@ let channels = [];
 
 async function loadChannels() {
 
-  const r =
+  const response =
     await fetch(
       "/api/channels"
     );
 
   channels =
-    await r.json();
+    await response.json();
 
   const select =
     document.getElementById(
@@ -1955,17 +2231,33 @@ async function loadChannels() {
   select.innerHTML = "";
 
   channels.forEach(
-    (c, i) => {
+    (channel, index) => {
 
       const option =
         document.createElement(
           "option"
         );
 
-      option.value = i;
+      option.value =
+        index;
+
+      let status = "";
+
+      if (
+        channel.live === true
+      ) {
+        status = " [LIVE]";
+      }
+
+      if (
+        channel.live === false
+      ) {
+        status = " [DEAD]";
+      }
 
       option.textContent =
-        c.name;
+        channel.name +
+        status;
 
       select.appendChild(
         option
@@ -1973,6 +2265,11 @@ async function loadChannels() {
     }
   );
 }
+
+
+// ==========================================================
+// PLAY SELECTED
+// ==========================================================
 
 async function playSelected() {
 
@@ -1993,7 +2290,7 @@ async function playSelected() {
     }
   );
 
-  // Cho server có thời gian tạo playlist mới
+  // Chờ HLS session mới tạo playlist
   setTimeout(
     () => {
 
@@ -2009,12 +2306,19 @@ async function playSelected() {
       video.load();
 
       video.play()
-        .catch(() => {});
+        .catch(
+          () => {}
+        );
 
     },
-    500
+    700
   );
 }
+
+
+// ==========================================================
+// NEXT
+// ==========================================================
 
 async function nextChannel() {
 
@@ -2040,26 +2344,31 @@ async function nextChannel() {
       video.load();
 
       video.play()
-        .catch(() => {});
+        .catch(
+          () => {}
+        );
 
     },
-    500
+    700
   );
-
-  loadChannels();
 }
+
+
+// ==========================================================
+// HEALTH
+// ==========================================================
 
 async function updateStats() {
 
   try {
 
-    const r =
+    const response =
       await fetch(
         "/health"
       );
 
     const data =
-      await r.json();
+      await response.json();
 
     document.getElementById(
       "stats"
@@ -2073,6 +2382,16 @@ async function updateStats() {
   } catch {}
 
 }
+
+
+// ==========================================================
+// REFRESH CHANNEL LIST
+// ==========================================================
+
+setInterval(
+  loadChannels,
+  10000
+);
 
 setInterval(
   updateStats,
@@ -2092,7 +2411,7 @@ loadChannels();
 
 
 // ============================================================
-// START SERVER
+// SERVER START
 // ============================================================
 
 async function main() {
@@ -2100,17 +2419,18 @@ async function main() {
   try {
 
     // --------------------------------------------------------
-    // Load M3U
+    // LOAD TOÀN BỘ M3U
     // --------------------------------------------------------
 
-    const allChannels =
+    channels =
       await loadPlaylist();
 
     if (
-      !allChannels.length
+      !channels.length
     ) {
+
       throw new Error(
-        "Playlist empty"
+        "Playlist is empty"
       );
     }
 
@@ -2123,15 +2443,19 @@ async function main() {
       () => {
 
         log(
-          `[SERVER] Port ${PORT}`
-        );
-
-        log(
-          `[SERVER] http://localhost:${PORT}`
+          `[SERVER] Running on port ${PORT}`
         );
 
         log(
           `[SERVER] /stream`
+        );
+
+        log(
+          `[SERVER] /hls/index.m3u8`
+        );
+
+        log(
+          `[SERVER] /api/channels`
         );
 
         log(
@@ -2141,39 +2465,38 @@ async function main() {
     );
 
     // --------------------------------------------------------
-    // CHECK BACKGROUND
+    // CHECK TẤT CẢ KÊNH
+    //
+    // 20 chỉ là concurrency.
+    // Không giới hạn playlist ở 20.
     // --------------------------------------------------------
 
-    const alive =
-      await checkChannels(
-        allChannels
+    await checkAllChannels();
+
+    // --------------------------------------------------------
+    // Tìm kênh LIVE đầu tiên
+    // --------------------------------------------------------
+
+    const firstLive =
+      channels.findIndex(
+        channel =>
+          channel.live === true
       );
 
-    log(
-      `[CHECK] LIVE ${alive.length}/${allChannels.length}`
-    );
+    if (
+      firstLive >= 0
+    ) {
 
-    if (!alive.length) {
+      startChannel(
+        firstLive
+      );
+
+    } else {
 
       log(
-        "[CHECK] No live channel"
+        "[SERVER] No live channel found"
       );
-
-      return;
     }
-
-    // --------------------------------------------------------
-    // CHỈ GIỮ KÊNH SỐNG
-    // --------------------------------------------------------
-
-    channels =
-      alive;
-
-    // --------------------------------------------------------
-    // START KÊNH ĐẦU TIÊN
-    // --------------------------------------------------------
-
-    startChannel(0);
 
   } catch (err) {
 
@@ -2185,9 +2508,6 @@ async function main() {
     process.exit(1);
   }
 }
-
-
-main();
 
 
 // ============================================================
@@ -2208,6 +2528,7 @@ process.on(
   }
 );
 
+
 process.on(
   "SIGINT",
   () => {
@@ -2221,3 +2542,10 @@ process.on(
     process.exit(0);
   }
 );
+
+
+// ============================================================
+// RUN
+// ============================================================
+
+main();

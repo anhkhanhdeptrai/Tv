@@ -94,6 +94,7 @@ let manuallyStopped = true;
 // M3U PARSER
 // =====================================================
 
+
 function parseM3U(content) {
   const lines = content.split(/\r?\n/);
   const result = [];
@@ -115,16 +116,26 @@ function parseM3U(content) {
 
     const url = line;
 
-    // Không lọc mạnh nữa: cần lấy hết kênh từ M3U, kể cả 720p/540p và các kênh
-    // có định dạng hơi khác hoặc đang lỗi, để người dùng có thể chọn thật sự.
-    if (!url || !url.trim()) {
+    if (!url.startsWith("http")) {
       currentInfo = null;
       continue;
     }
 
+    // Lấy tên kênh
     let name = currentInfo.split(",").pop().trim();
 
     if (!name) name = "Unknown channel";
+
+    // Ghép thông tin EXTINF và URL để nhận diện độ phân giải
+    const info = currentInfo + " " + name + " " + url;
+
+    // Chỉ lấy kênh 720p
+    const is720p = /\b720p\b/i.test(info);
+
+    if (!is720p) {
+      currentInfo = null;
+      continue;
+    }
 
     const groupMatch =
       currentInfo.match(/group-title="([^"]*)"/i);
@@ -141,11 +152,14 @@ function parseM3U(content) {
       group: groupMatch ? groupMatch[1] : "",
       logo: logoMatch ? logoMatch[1] : "",
       tvgId: idMatch ? idMatch[1] : "",
-      url
+      url,
+      resolution: "720p"
     });
 
     currentInfo = null;
   }
+
+  console.log("[M3U] 720p CHANNELS:", result.length);
 
   return result;
 }

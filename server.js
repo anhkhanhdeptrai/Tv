@@ -17,79 +17,40 @@ const M3U_URL =
 const WIDTH = 340;
 const HEIGHT = 230;
 const FPS = 8;
+
 const JPEG_QUALITY = 8;
 
-// Buffer tối đa.
-// Không bao giờ cho video tích quá số frame này.
-const VIDEO_BUFFER_SECONDS = 5;
-
-const VIDEO_MAX_FRAMES =
-  FPS * VIDEO_BUFFER_SECONDS;
-
-// Khi backlog quá lớn, bỏ frame cũ.
-// Mục tiêu là luôn ở gần live.
-const VIDEO_KEEP_SECONDS = 4;
-
-const VIDEO_KEEP_FRAMES =
-  FPS * VIDEO_KEEP_SECONDS;
+// Chỉ giữ đúng 1 frame mới nhất.
+// Không xếp hàng frame cũ.
+let latestFrame = null;
 
 // =====================================================
 // AUDIO
 // =====================================================
 
-const AUDIO_SAMPLE_RATE = 44100;
+const AUDIO_SAMPLE_RATE = 48000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 
-// Buffer audio tối đa 5 giây.
-const AUDIO_BUFFER_SECONDS = 5;
-
+// Giữ tối đa khoảng 200ms audio
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
-  AUDIO_BUFFER_SECONDS;
+  0.2;
 
-// Phát PCM 20ms/lần.
-const AUDIO_CHUNK_MS = 20;
-
+// 20ms / chunk
 const AUDIO_CHUNK_SIZE =
-  Math.floor(
-    AUDIO_SAMPLE_RATE *
-      AUDIO_CHANNELS *
-      AUDIO_BYTES_PER_SAMPLE *
-      AUDIO_CHUNK_MS /
-      1000
-  );
-
-// Giữ khoảng 4 giây khi cần drop cache cũ.
-const AUDIO_KEEP_SECONDS = 4;
-
-const AUDIO_KEEP_BYTES =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
-  AUDIO_KEEP_SECONDS;
+  0.02;
 
 // =====================================================
-// PREBUFFER
+// NETWORK
 // =====================================================
 
-// Không phát ngay khi FFmpeg mới bắt đầu.
-// Chờ khoảng 5 giây dữ liệu.
-const PREBUFFER_SECONDS = 5;
-
-const PREBUFFER_VIDEO_FRAMES =
-  VIDEO_MAX_FRAMES;
-
-const PREBUFFER_AUDIO_BYTES =
-  AUDIO_BUFFER_MAX;
-
-// =====================================================
-// BACKPRESSURE
-// =====================================================
-
-const MAX_BACKPRESSURE = 20;
+const M3U_TIMEOUT = 10000;
 
 // =====================================================
 // STATE
@@ -101,441 +62,99 @@ let currentChannel = null;
 
 let ffmpeg = null;
 
-let generation = 0;
+// Mỗi FFmpeg có generation riêng.
+// Dữ liệu process cũ sẽ bị loại hoàn toàn.
+let ffmpegGeneration = 0;
 
 // =====================================================
-// VIDEO RING BUFFER
+// VIDEO PARSER
 // =====================================================
 
-const videoRing =
-  new Array(VIDEO_MAX_FRAMES);
+let jpegBuffer = Buffer.alloc(0);
 
-let videoWrite = 0;
-let videoCount = 0;
+const JPEG_START = Buffer.from([
+  0xff,
+  0xd8
+]);
 
-// =====================================================
-// AUDIO RING BUFFER
-// =====================================================
-
-const audioRing =
-  Buffer.alloc(AUDIO_BUFFER_MAX);
-
-let audioWrite = 0;
-let audioRead = 0;
-let audioSize = 0;
+const JPEG_END = Buffer.from([
+  0xff,
+  0xd9
+]);
 
 // =====================================================
-// PARSER
+// AUDIO BUFFER
 // =====================================================
 
-let jpegBuffer =
-  Buffer.alloc(0);
-
-let audioInputBuffer =
-  Buffer.alloc(0);
-
-const JPEG_START =
-  Buffer.from([0xff, 0xd8]);
-
-const JPEG_END =
-  Buffer.from([0xff, 0xd9]);
-
-// =====================================================
-// VIDEO RESET
-// =====================================================
-
-function clearVideo() {
-  for (
-    let i = 0;
-    i < videoRing.length;
-    i++
-  ) {
-    videoRing[i] = null;
-  }
-
-  videoWrite = 0;
-  videoCount = 0;
-}
-
-// =====================================================
-// AUDIO RESET
-// =====================================================
-
-function clearAudio() {
-  audioWrite = 0;
-  audioRead = 0;
-  audioSize = 0;
-
-  audioInputBuffer =
-    Buffer.alloc(0);
-}
-
-// =====================================================
-// CLEAR ALL
-// =====================================================
-
-function clearBuffers() {
-  clearVideo();
-  clearAudio();
-
-  jpegBuffer =
-    Buffer.alloc(0);
-}
-
-// =====================================================
-// VIDEO PUSH
-// =====================================================
-
-function pushVideo(frame) {
-  if (!frame) {
-    return;
-  }
-
-  // Buffer đầy:
-  // ghi đè frame cũ nhất.
-  videoRing[videoWrite] =
-    frame;
-
-  videoWrite =
-    (
-      videoWrite + 1
-    ) %
-    VIDEO_MAX_FRAMES;
-
-  if (
-    videoCount <
-    VIDEO_MAX_FRAMES
-  ) {
-    videoCount++;
-  }
-}
-
-// =====================================================
-// VIDEO OLDEST INDEX
-// =====================================================
-
-function videoOldestIndex() {
-  return (
-    videoWrite -
-    videoCount +
-    VIDEO_MAX_FRAMES
-  ) %
-  VIDEO_MAX_FRAMES;
-}
-
-// =====================================================
-// VIDEO POP
-// =====================================================
-
-function popVideo() {
-  if (
-    videoCount <= 0
-  ) {
-    return null;
-  }
-
-  const index =
-    videoOldestIndex();
-
-  const frame =
-    videoRing[index];
-
-  videoRing[index] =
-    null;
-
-  videoCount--;
-
-  return frame;
-}
-
-// =====================================================
-// DROP VIDEO OLD CACHE
-// =====================================================
-
-function dropOldVideo() {
-  while (
-    videoCount >
-    VIDEO_KEEP_FRAMES
-  ) {
-    popVideo();
-  }
-}
-
-// =====================================================
-// AUDIO PUSH
-// =====================================================
-
-function pushAudio(data) {
-  if (
-    !data ||
-    data.length === 0
-  ) {
-    return;
-  }
-
-  let offset = 0;
-
-  while (
-    offset <
-    data.length
-  ) {
-    const remaining =
-      data.length - offset;
-
-    // Nếu một chunk lớn hơn toàn bộ ring,
-    // chỉ lấy phần cuối.
-    if (
-      remaining >=
-      AUDIO_BUFFER_MAX
-    ) {
-      data.copy(
-        audioRing,
-        0,
-        data.length -
-          AUDIO_BUFFER_MAX
-      );
-
-      audioRead = 0;
-      audioWrite = 0;
-      audioSize =
-        AUDIO_BUFFER_MAX;
-
-      return;
-    }
-
-    // Nếu không đủ chỗ,
-    // bỏ audio cũ nhất.
-    const free =
-      AUDIO_BUFFER_MAX -
-      audioSize;
-
-    if (
-      free <
-      remaining
-    ) {
-      const drop =
-        remaining - free;
-
-      audioRead =
-        (
-          audioRead +
-          drop
-        ) %
-        AUDIO_BUFFER_MAX;
-
-      audioSize -= drop;
-    }
-
-    const first =
-      Math.min(
-        remaining,
-        AUDIO_BUFFER_MAX -
-          audioWrite
-      );
-
-    data.copy(
-      audioRing,
-      audioWrite,
-      offset,
-      offset + first
-    );
-
-    audioWrite =
-      (
-        audioWrite +
-        first
-      ) %
-      AUDIO_BUFFER_MAX;
-
-    audioSize += first;
-
-    offset += first;
-
-    if (
-      offset <
-      data.length
-    ) {
-      const second =
-        data.length -
-        offset;
-
-      data.copy(
-        audioRing,
-        audioWrite,
-        offset,
-        offset + second
-      );
-
-      audioWrite =
-        (
-          audioWrite +
-          second
-        ) %
-        AUDIO_BUFFER_MAX;
-
-      audioSize += second;
-
-      offset += second;
-    }
-  }
-}
-
-// =====================================================
-// AUDIO READ
-// =====================================================
-
-function readAudio(size) {
-  if (
-    audioSize <
-    size
-  ) {
-    return null;
-  }
-
-  const result =
-    Buffer.allocUnsafe(size);
-
-  const first =
-    Math.min(
-      size,
-      AUDIO_BUFFER_MAX -
-        audioRead
-    );
-
-  audioRing.copy(
-    result,
-    0,
-    audioRead,
-    audioRead + first
-  );
-
-  if (
-    first <
-    size
-  ) {
-    audioRing.copy(
-      result,
-      first,
-      0,
-      size - first
-    );
-  }
-
-  audioRead =
-    (
-      audioRead +
-      size
-    ) %
-    AUDIO_BUFFER_MAX;
-
-  audioSize -= size;
-
-  return result;
-}
-
-// =====================================================
-// DROP AUDIO OLD CACHE
-// =====================================================
-
-function dropOldAudio() {
-  if (
-    audioSize >
-    AUDIO_KEEP_BYTES
-  ) {
-    const drop =
-      audioSize -
-      AUDIO_KEEP_BYTES;
-
-    audioRead =
-      (
-        audioRead +
-        drop
-      ) %
-      AUDIO_BUFFER_MAX;
-
-    audioSize =
-      AUDIO_KEEP_BYTES;
-  }
-}
+let audioBuffer = Buffer.alloc(0);
 
 // =====================================================
 // DOWNLOAD M3U
 // =====================================================
 
 function downloadM3U(url) {
-  return new Promise(
-    (resolve, reject) => {
-      const protocol =
-        url.startsWith("https:")
-          ? https
-          : http;
+  return new Promise((resolve, reject) => {
+    const protocol =
+      url.startsWith("https:")
+        ? https
+        : http;
 
-      const request =
-        protocol.get(
-          url,
-          {
-            headers: {
-              "User-Agent":
-                "Mozilla/5.0",
-              Accept:
-                "*/*"
-            }
-          },
-          response => {
-            let data = "";
+    const request = protocol.get(
+      url,
+      {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          "Accept": "*/*"
+        }
+      },
+      response => {
+        let data = "";
 
-            response.setEncoding(
-              "utf8"
-            );
+        response.setEncoding("utf8");
 
-            response.on(
-              "data",
-              chunk => {
-                data += chunk;
-              }
-            );
-
-            response.on(
-              "end",
-              () => {
-                if (
-                  response.statusCode <
-                    200 ||
-                  response.statusCode >=
-                    300
-                ) {
-                  reject(
-                    new Error(
-                      `M3U HTTP ${response.statusCode}`
-                    )
-                  );
-
-                  return;
-                }
-
-                resolve(data);
-              }
-            );
+        response.on(
+          "data",
+          chunk => {
+            data += chunk;
           }
         );
 
-      request.setTimeout(
-        10000,
-        () => {
-          request.destroy(
-            new Error(
-              "M3U timeout"
-            )
-          );
-        }
-      );
+        response.on(
+          "end",
+          () => {
+            if (
+              response.statusCode < 200 ||
+              response.statusCode >= 300
+            ) {
+              reject(
+                new Error(
+                  `M3U HTTP ${response.statusCode}`
+                )
+              );
 
-      request.on(
-        "error",
-        reject
-      );
-    }
-  );
+              return;
+            }
+
+            resolve(data);
+          }
+        );
+      }
+    );
+
+    request.setTimeout(
+      M3U_TIMEOUT,
+      () => {
+        request.destroy(
+          new Error("M3U timeout")
+        );
+      }
+    );
+
+    request.on(
+      "error",
+      reject
+    );
+  });
 }
 
 // =====================================================
@@ -543,13 +162,10 @@ function downloadM3U(url) {
 // =====================================================
 
 function parseM3U(text) {
-  const lines =
-    text
-      .split(/\r?\n/)
-      .map(x =>
-        x.trim()
-      )
-      .filter(Boolean);
+  const lines = text
+    .split(/\r?\n/)
+    .map(x => x.trim())
+    .filter(Boolean);
 
   const result = [];
 
@@ -558,13 +174,10 @@ function parseM3U(text) {
     i < lines.length;
     i++
   ) {
-    const line =
-      lines[i];
+    const line = lines[i];
 
     if (
-      !line.startsWith(
-        "#EXTINF"
-      )
+      !line.startsWith("#EXTINF")
     ) {
       continue;
     }
@@ -572,8 +185,7 @@ function parseM3U(text) {
     let name =
       line
         .substring(
-          line.lastIndexOf(",") +
-            1
+          line.lastIndexOf(",") + 1
         )
         .trim();
 
@@ -615,9 +227,7 @@ function parseM3U(text) {
       if (
         !lines[j].startsWith("#")
       ) {
-        url =
-          lines[j];
-
+        url = lines[j];
         break;
       }
     }
@@ -633,17 +243,15 @@ function parseM3U(text) {
         `Channel ${result.length + 1}`;
     }
 
+    // Bỏ Geo-blocked
     if (
-      line.includes(
-        "[Geo-blocked]"
-      ) ||
-      name.includes(
-        "[Geo-blocked]"
-      )
+      line.includes("[Geo-blocked]") ||
+      name.includes("[Geo-blocked]")
     ) {
       continue;
     }
 
+    // Không hỗ trợ DASH
     if (
       url
         .toLowerCase()
@@ -653,9 +261,7 @@ function parseM3U(text) {
     }
 
     result.push({
-      id: String(
-        result.length
-      ),
+      id: String(result.length),
       name,
       tvgId,
       tvgName,
@@ -669,28 +275,50 @@ function parseM3U(text) {
 }
 
 // =====================================================
+// CLEAR VIDEO
+// =====================================================
+
+function clearVideoBuffer() {
+  latestFrame = null;
+  jpegBuffer = Buffer.alloc(0);
+}
+
+// =====================================================
+// CLEAR AUDIO
+// =====================================================
+
+function clearAudioBuffer() {
+  audioBuffer = Buffer.alloc(0);
+}
+
+// =====================================================
+// CLEAR EVERYTHING
+// =====================================================
+
+function clearAllBuffers() {
+  clearVideoBuffer();
+  clearAudioBuffer();
+}
+
+// =====================================================
 // STOP FFMPEG
 // =====================================================
 
 function stopFFmpeg() {
-  // Vô hiệu hóa process cũ trước.
-  generation++;
+  // Vô hiệu hóa process cũ NGAY LẬP TỨC.
+  ffmpegGeneration++;
 
-  const old =
-    ffmpeg;
+  const oldFFmpeg = ffmpeg;
 
   ffmpeg = null;
 
-  // Xóa toàn bộ cache NGAY.
-  clearBuffers();
-
-  if (old) {
+  if (oldFFmpeg) {
     try {
-      old.kill(
-        "SIGKILL"
-      );
+      oldFFmpeg.kill("SIGKILL");
     } catch {}
   }
+
+  clearAllBuffers();
 }
 
 // =====================================================
@@ -711,11 +339,12 @@ function startFFmpeg(channel) {
   );
 
   console.log(
-    "START:",
+    "START CHANNEL:",
     channel.name
   );
 
   console.log(
+    "URL:",
     channel.url
   );
 
@@ -723,19 +352,22 @@ function startFFmpeg(channel) {
     "======================================"
   );
 
-  // Quan trọng:
-  // không giữ bất kỳ dữ liệu cũ nào.
+  // ---------------------------------------------------
+  // Dừng process cũ hoàn toàn
+  // ---------------------------------------------------
+
+  currentChannel = null;
+
   stopFFmpeg();
 
-  currentChannel =
-    channel;
+  currentChannel = channel;
 
-  const myGeneration =
-    generation;
+  const generation =
+    ffmpegGeneration;
 
-  // ===================================================
+  // ---------------------------------------------------
   // FFMPEG
-  // ===================================================
+  // ---------------------------------------------------
 
   const args = [
     "-hide_banner",
@@ -743,9 +375,9 @@ function startFFmpeg(channel) {
     "-loglevel",
     "warning",
 
-    // ================================================
-    // HTTP/HLS RECONNECT
-    // ================================================
+    // =================================================
+    // HLS / HTTP RECONNECT
+    // =================================================
 
     "-reconnect",
     "1",
@@ -753,21 +385,12 @@ function startFFmpeg(channel) {
     "-reconnect_streamed",
     "1",
 
-    "-reconnect_at_eof",
-    "1",
-
-    "-reconnect_on_network_error",
-    "1",
-
-    "-reconnect_on_http_error",
-    "4xx,5xx",
-
     "-reconnect_delay_max",
-    "2",
+    "3",
 
-    // ================================================
-    // INPUT
-    // ================================================
+    // =================================================
+    // TIMESTAMP
+    // =================================================
 
     "-fflags",
     "+genpts+discardcorrupt",
@@ -775,12 +398,18 @@ function startFFmpeg(channel) {
     "-flags",
     "low_delay",
 
+    // =================================================
+    // REALTIME INPUT
+    // =================================================
+
+    "-re",
+
     "-i",
     channel.url,
 
-    // ================================================
+    // =================================================
     // VIDEO
-    // ================================================
+    // =================================================
 
     "-map",
     "0:v:0",
@@ -800,7 +429,7 @@ function startFFmpeg(channel) {
     String(JPEG_QUALITY),
 
     "-threads",
-    "1",
+    "2",
 
     "-pix_fmt",
     "yuvj420p",
@@ -813,27 +442,20 @@ function startFFmpeg(channel) {
 
     "pipe:1",
 
-    // ================================================
+    // =================================================
     // AUDIO
-    // ================================================
+    // =================================================
 
     "-map",
     "0:a:0?",
 
     "-vn",
 
-    "-af",
-    "aresample=async=1:min_hard_comp=0.100:first_pts=0",
-
     "-ac",
-    String(
-      AUDIO_CHANNELS
-    ),
+    String(AUDIO_CHANNELS),
 
     "-ar",
-    String(
-      AUDIO_SAMPLE_RATE
-    ),
+    String(AUDIO_SAMPLE_RATE),
 
     "-c:a",
     "pcm_s16le",
@@ -844,7 +466,7 @@ function startFFmpeg(channel) {
     "pipe:3"
   ];
 
-  const child =
+  const processFFmpeg =
     spawn(
       "ffmpeg",
       args,
@@ -858,49 +480,47 @@ function startFFmpeg(channel) {
       }
     );
 
-  ffmpeg =
-    child;
+  ffmpeg = processFFmpeg;
 
   // =================================================
   // STDERR
   // =================================================
 
-  child.stderr.on(
+  processFFmpeg.stderr.on(
     "data",
     data => {
       if (
-        myGeneration !==
-        generation ||
-        child !== ffmpeg
+        generation !==
+        ffmpegGeneration
       ) {
         return;
       }
 
-      const msg =
+      const message =
         data
           .toString()
           .trim();
 
-      if (msg) {
+      if (message) {
         console.log(
           "[FFmpeg]",
-          msg
+          message
         );
       }
     }
   );
 
   // =================================================
-  // VIDEO PARSER
+  // VIDEO
   // =================================================
 
-  child.stdout.on(
+  processFFmpeg.stdout.on(
     "data",
     chunk => {
       if (
-        myGeneration !==
-          generation ||
-        child !== ffmpeg
+        generation !==
+          ffmpegGeneration ||
+        processFFmpeg !== ffmpeg
       ) {
         return;
       }
@@ -917,30 +537,23 @@ function startFFmpeg(channel) {
             JPEG_START
           );
 
-        if (
-          start < 0
-        ) {
-          // Không để parser lỗi tăng RAM.
+        if (start === -1) {
+          // Không cho buffer lỗi phình RAM
           if (
             jpegBuffer.length >
             512 * 1024
           ) {
             jpegBuffer =
-              jpegBuffer.slice(
-                -64 * 1024
-              );
+              Buffer.alloc(0);
           }
 
           break;
         }
 
-        if (
-          start > 0
-        ) {
+        // Bỏ dữ liệu trước JPEG
+        if (start > 0) {
           jpegBuffer =
-            jpegBuffer.slice(
-              start
-            );
+            jpegBuffer.slice(start);
         }
 
         const end =
@@ -949,13 +562,11 @@ function startFFmpeg(channel) {
             2
           );
 
-        if (
-          end < 0
-        ) {
+        if (end === -1) {
           break;
         }
 
-        const frame =
+        const jpeg =
           Buffer.from(
             jpegBuffer.slice(
               0,
@@ -968,40 +579,27 @@ function startFFmpeg(channel) {
             end + 2
           );
 
+        // Kiểm tra JPEG
         if (
-          frame.length < 100 ||
-          frame[0] !== 0xff ||
-          frame[1] !== 0xd8 ||
-          frame[
-            frame.length - 2
-          ] !== 0xff ||
-          frame[
-            frame.length - 1
-          ] !== 0xd9
+          jpeg.length < 100 ||
+          jpeg[0] !== 0xff ||
+          jpeg[1] !== 0xd8 ||
+          jpeg[jpeg.length - 2] !== 0xff ||
+          jpeg[jpeg.length - 1] !== 0xd9
         ) {
           continue;
         }
 
-        pushVideo({
-          data: frame,
+        // =================================================
+        // QUAN TRỌNG:
+        // CHỈ GIỮ FRAME CUỐI CÙNG
+        // =================================================
 
-          time:
-            Date.now(),
-
-          generation:
-            myGeneration
-        });
-      }
-
-      // ===============================================
-      // CHỐNG CACHE CŨ
-      // ===============================================
-
-      if (
-        videoCount >
-        VIDEO_MAX_FRAMES
-      ) {
-        dropOldVideo();
+        latestFrame = {
+          data: jpeg,
+          time: Date.now(),
+          generation
+        };
       }
     }
   );
@@ -1010,31 +608,47 @@ function startFFmpeg(channel) {
   // AUDIO
   // =================================================
 
-  child.stdio[3].on(
+  processFFmpeg.stdio[3].on(
     "data",
     chunk => {
       if (
-        myGeneration !==
-          generation ||
-        child !== ffmpeg
+        generation !==
+          ffmpegGeneration ||
+        processFFmpeg !== ffmpeg
       ) {
         return;
       }
 
-      // PCM đã là dữ liệu raw.
-      // Đưa trực tiếp vào ring.
-      pushAudio(chunk);
+      audioBuffer =
+        Buffer.concat([
+          audioBuffer,
+          chunk
+        ]);
 
-      // Không bao giờ để audio cũ tích tụ.
-      dropOldAudio();
+      // =================================================
+      // KHÔNG CHO AUDIO TÍCH LŨY
+      // =================================================
+
+      if (
+        audioBuffer.length >
+        AUDIO_BUFFER_MAX
+      ) {
+        // Bỏ audio cũ.
+        // Chỉ giữ phần mới nhất.
+        audioBuffer =
+          audioBuffer.slice(
+            audioBuffer.length -
+              AUDIO_BUFFER_MAX
+          );
+      }
     }
   );
 
   // =================================================
-  // CLOSE
+  // PROCESS CLOSE
   // =================================================
 
-  child.on(
+  processFFmpeg.on(
     "close",
     code => {
       console.log(
@@ -1043,29 +657,29 @@ function startFFmpeg(channel) {
       );
 
       if (
-        myGeneration !==
-          generation ||
-        child !== ffmpeg
+        generation !==
+          ffmpegGeneration ||
+        processFFmpeg !== ffmpeg
       ) {
         return;
       }
 
       ffmpeg = null;
 
-      clearBuffers();
+      clearAllBuffers();
     }
   );
 
   // =================================================
-  // ERROR
+  // PROCESS ERROR
   // =================================================
 
-  child.on(
+  processFFmpeg.on(
     "error",
     error => {
       if (
-        myGeneration !==
-        generation
+        generation !==
+        ffmpegGeneration
       ) {
         return;
       }
@@ -1098,18 +712,11 @@ app.get(
 
       channels:
         channels.map(
-          ch => ({
-            id:
-              ch.id,
-
-            name:
-              ch.name,
-
-            group:
-              ch.group,
-
-            logo:
-              ch.logo
+          channel => ({
+            id: channel.id,
+            name: channel.name,
+            group: channel.group,
+            logo: channel.logo
           })
         )
     });
@@ -1143,9 +750,7 @@ app.get(
     }
 
     const started =
-      startFFmpeg(
-        channel
-      );
+      startFFmpeg(channel);
 
     if (!started) {
       return res
@@ -1160,20 +765,15 @@ app.get(
     res.json({
       ok: true,
 
-      id:
-        channel.id,
+      id: channel.id,
 
-      name:
-        channel.name,
+      name: channel.name,
 
       video:
         "/stream",
 
       audio:
         "/audio",
-
-      buffer:
-        "5 seconds",
 
       format: {
         video:
@@ -1202,19 +802,22 @@ app.get(
 app.get(
   "/api/stop",
   (req, res) => {
-    currentChannel =
-      null;
+    currentChannel = null;
 
     stopFFmpeg();
 
+    clearAllBuffers();
+
     res.json({
-      ok: true
+      ok: true,
+      message:
+        "Đã dừng phát"
     });
   }
 );
 
 // =====================================================
-// VIDEO
+// VIDEO MJPEG
 // =====================================================
 
 app.get(
@@ -1263,19 +866,24 @@ app.get(
     );
 
     if (
-      res.flushHeaders
+      typeof res.flushHeaders ===
+      "function"
     ) {
       res.flushHeaders();
     }
 
     let closed = false;
 
-    let started = false;
+    let waitingForDrain = false;
 
-    let clientGeneration =
-      generation;
+    let lastFrameTime = 0;
 
-    let badWrites = 0;
+    // =================================================
+    // Gửi frame theo CLOCK của server
+    // =================================================
+
+    const interval =
+      1000 / FPS;
 
     const timer =
       setInterval(
@@ -1295,53 +903,14 @@ app.get(
             return;
           }
 
-          // ===========================================
-          // KÊNH MỚI
-          // ===========================================
-
           if (
-            clientGeneration !==
-            generation
+            waitingForDrain
           ) {
-            clientGeneration =
-              generation;
-
-            started = false;
-
             return;
           }
 
-          // ===========================================
-          // PREBUFFER
-          // ===========================================
-
-          if (!started) {
-            if (
-              videoCount <
-              PREBUFFER_VIDEO_FRAMES
-            ) {
-              return;
-            }
-
-            started = true;
-          }
-
-          // ===========================================
-          // CHỐNG BACKLOG
-          //
-          // Nếu buffer vẫn quá đầy,
-          // bỏ frame cũ trước khi phát.
-          // ===========================================
-
-          if (
-            videoCount >
-            VIDEO_KEEP_FRAMES + 2
-          ) {
-            dropOldVideo();
-          }
-
           const frame =
-            popVideo();
+            latestFrame;
 
           if (!frame) {
             return;
@@ -1349,10 +918,21 @@ app.get(
 
           if (
             frame.generation !==
-            generation
+            ffmpegGeneration
           ) {
             return;
           }
+
+          // Không gửi lại cùng frame
+          if (
+            frame.time ===
+            lastFrameTime
+          ) {
+            return;
+          }
+
+          lastFrameTime =
+            frame.time;
 
           try {
             const header =
@@ -1365,9 +945,7 @@ app.get(
               );
 
             const ok1 =
-              res.write(
-                header
-              );
+              res.write(header);
 
             const ok2 =
               res.write(
@@ -1385,54 +963,44 @@ app.get(
               !ok3 ||
               res.writableNeedDrain
             ) {
-              badWrites++;
-
-              // Không giữ client chậm
-              // mãi mãi.
-              if (
-                badWrites >=
-                MAX_BACKPRESSURE
-              ) {
-                console.log(
-                  "Đóng video client chậm"
-                );
-
-                closed = true;
-
-                clearInterval(
-                  timer
-                );
-
-                try {
-                  res.destroy();
-                } catch {}
-              }
-            } else {
-              badWrites = 0;
+              waitingForDrain =
+                true;
             }
           } catch {
             closed = true;
 
-            clearInterval(
-              timer
-            );
+            clearInterval(timer);
 
             try {
-              res.destroy();
+              res.end();
             } catch {}
           }
         },
-        1000 / FPS
+        interval
       );
+
+    // =================================================
+    // BACKPRESSURE
+    // =================================================
+
+    res.on(
+      "drain",
+      () => {
+        waitingForDrain =
+          false;
+      }
+    );
+
+    // =================================================
+    // CLIENT CLOSE
+    // =================================================
 
     req.on(
       "close",
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
 
@@ -1441,9 +1009,7 @@ app.get(
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
 
@@ -1452,16 +1018,14 @@ app.get(
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
   }
 );
 
 // =====================================================
-// AUDIO
+// AUDIO PCM
 // =====================================================
 
 app.get(
@@ -1530,19 +1094,19 @@ app.get(
     );
 
     if (
-      res.flushHeaders
+      typeof res.flushHeaders ===
+      "function"
     ) {
       res.flushHeaders();
     }
 
     let closed = false;
 
-    let started = false;
+    let waitingForDrain = false;
 
-    let clientGeneration =
-      generation;
-
-    let badWrites = 0;
+    // =================================================
+    // AUDIO CLOCK
+    // =================================================
 
     const timer =
       setInterval(
@@ -1562,63 +1126,30 @@ app.get(
             return;
           }
 
-          // ===========================================
-          // KÊNH MỚI
-          // ===========================================
-
           if (
-            clientGeneration !==
-            generation
+            waitingForDrain
           ) {
-            clientGeneration =
-              generation;
-
-            started = false;
-
             return;
           }
 
-          // ===========================================
-          // PREBUFFER 5 GIÂY
-          // ===========================================
-
-          if (!started) {
-            if (
-              audioSize <
-              PREBUFFER_AUDIO_BYTES
-            ) {
-              return;
-            }
-
-            started = true;
-          }
-
-          // ===========================================
-          // KHÔNG CHO AUDIO CŨ TÍCH TỤ
-          // ===========================================
-
           if (
-            audioSize >
-            AUDIO_KEEP_BYTES
+            audioBuffer.length <
+            AUDIO_CHUNK_SIZE
           ) {
-            dropOldAudio();
+            return;
           }
 
-          // ===========================================
-          // 20ms AUDIO
-          // ===========================================
-
+          // Lấy audio mới nhất
           const chunk =
-            readAudio(
+            audioBuffer.slice(
+              0,
               AUDIO_CHUNK_SIZE
             );
 
-          if (!chunk) {
-            // Nguồn đang giật.
-            // Chờ dữ liệu mới,
-            // KHÔNG PHÁT LẠI CACHE.
-            return;
-          }
+          audioBuffer =
+            audioBuffer.slice(
+              AUDIO_CHUNK_SIZE
+            );
 
           try {
             const ok =
@@ -1628,52 +1159,44 @@ app.get(
               !ok ||
               res.writableNeedDrain
             ) {
-              badWrites++;
-
-              if (
-                badWrites >=
-                MAX_BACKPRESSURE
-              ) {
-                console.log(
-                  "Đóng audio client chậm"
-                );
-
-                closed = true;
-
-                clearInterval(
-                  timer
-                );
-
-                try {
-                  res.destroy();
-                } catch {}
-              }
-            } else {
-              badWrites = 0;
+              waitingForDrain =
+                true;
             }
           } catch {
             closed = true;
 
-            clearInterval(
-              timer
-            );
+            clearInterval(timer);
 
             try {
-              res.destroy();
+              res.end();
             } catch {}
           }
         },
-        AUDIO_CHUNK_MS
+        20
       );
+
+    // =================================================
+    // BACKPRESSURE
+    // =================================================
+
+    res.on(
+      "drain",
+      () => {
+        waitingForDrain =
+          false;
+      }
+    );
+
+    // =================================================
+    // CLIENT CLOSE
+    // =================================================
 
     req.on(
       "close",
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
 
@@ -1682,9 +1205,7 @@ app.get(
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
 
@@ -1693,9 +1214,7 @@ app.get(
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
   }
@@ -1709,8 +1228,7 @@ app.get(
   "/health",
   (req, res) => {
     res.json({
-      status:
-        "ok",
+      status: "ok",
 
       channels:
         channels.length,
@@ -1729,56 +1247,34 @@ app.get(
       playing:
         !!ffmpeg,
 
-      generation,
+      generation:
+        ffmpegGeneration,
 
-      buffer: {
-        videoFrames:
-          videoCount,
+      memory: {
+        latestFrameBytes:
+          latestFrame
+            ? latestFrame.data.length
+            : 0,
 
-        videoMaxFrames:
-          VIDEO_MAX_FRAMES,
+        jpegParserBytes:
+          jpegBuffer.length,
 
-        videoSeconds:
-          (
-            videoCount /
-            FPS
-          ).toFixed(2),
+        audioBufferBytes:
+          audioBuffer.length,
 
-        audioBytes:
-          audioSize,
-
-        audioMaxBytes:
-          AUDIO_BUFFER_MAX,
-
-        audioSeconds:
-          (
-            audioSize /
-            (
-              AUDIO_SAMPLE_RATE *
-              AUDIO_CHANNELS *
-              AUDIO_BYTES_PER_SAMPLE
-            )
-          ).toFixed(2)
+        audioBufferMax:
+          AUDIO_BUFFER_MAX
       },
 
       video: {
-        width:
-          WIDTH,
-
-        height:
-          HEIGHT,
-
-        fps:
-          FPS,
-
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS,
         quality:
           JPEG_QUALITY,
 
-        buffer:
-          "5s fixed ring",
-
-        oldCache:
-          "DROP",
+        mode:
+          "LATEST FRAME ONLY",
 
         endpoint:
           "/stream"
@@ -1794,17 +1290,9 @@ app.get(
         channels:
           AUDIO_CHANNELS,
 
-        bits:
-          16,
+        bits: 16,
 
-        chunkMs:
-          AUDIO_CHUNK_MS,
-
-        buffer:
-          "5s fixed ring",
-
-        oldCache:
-          "DROP",
+        chunkMs: 20,
 
         endpoint:
           "/audio"
@@ -1822,18 +1310,19 @@ app.listen(
   "0.0.0.0",
   async () => {
     console.log("");
+
     console.log(
       "======================================"
     );
+
     console.log(
       "ESP32 IPTV SERVER"
     );
+
     console.log(
-      "LIVE RING BUFFER"
+      "REALTIME / LOW LATENCY"
     );
-    console.log(
-      "NO OLD CACHE"
-    );
+
     console.log(
       "======================================"
     );
@@ -1847,19 +1336,35 @@ app.listen(
     );
 
     console.log(
-      "Video buffer: 5 seconds"
+      "Video: MJPEG"
     );
 
     console.log(
-      "Audio buffer: 5 seconds"
+      `Audio: PCM ${AUDIO_SAMPLE_RATE}Hz Mono 16-bit`
     );
 
     console.log(
-      "Old cache: DROP"
+      "Frame cache: 1 frame"
+    );
+
+    console.log(
+      "Audio cache: ~200ms"
     );
 
     console.log(
       "Disk cache: OFF"
+    );
+
+    console.log(
+      "HLS cache: OFF"
+    );
+
+    console.log(
+      "Auto play: OFF"
+    );
+
+    console.log(
+      "Web UI: OFF"
     );
 
     console.log(
@@ -1884,32 +1389,51 @@ app.listen(
         channels.length
       );
 
+      console.log("");
+
+      console.log(
+        "======================================"
+      );
+
       console.log(
         "SERVER READY"
       );
 
       console.log(
-        `API: /api/channels`
+        "Channels:",
+        channels.length
       );
 
       console.log(
-        `Select: /api/select/ID`
+        "Chưa phát kênh nào."
       );
 
       console.log(
-        `Video: /stream`
+        `API: http://SERVER:${PORT}/api/channels`
       );
 
       console.log(
-        `Audio: /audio`
+        `Select: http://SERVER:${PORT}/api/select/ID`
       );
 
       console.log(
-        `Health: /health`
+        `Video: http://SERVER:${PORT}/stream`
+      );
+
+      console.log(
+        `Audio: http://SERVER:${PORT}/audio`
+      );
+
+      console.log(
+        `Health: http://SERVER:${PORT}/health`
+      );
+
+      console.log(
+        "======================================"
       );
     } catch (error) {
       console.error(
-        "M3U ERROR:",
+        "LỖI:",
         error.message
       );
     }

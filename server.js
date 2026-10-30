@@ -19,27 +19,30 @@ const FPS = 8;
 const JPEG_QUALITY = 10;
 
 const MAX_JPEG_BUFFER = 1024 * 1024;
+const FRAME_TIMEOUT = 15000;
 
 // =====================================================
-// AUDIO CONFIG
+// AUDIO CONFIG - LOW LOAD PCM U8
 // =====================================================
 
-const AUDIO_SAMPLE_RATE = 44100;
+const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
-const AUDIO_BYTES_PER_SAMPLE = 2;
+const AUDIO_BITS = 8;
+const AUDIO_BYTES_PER_SAMPLE = 1;
+
+const AUDIO_CHUNK_MS = 20;
+
+const AUDIO_CHUNK_SIZE =
+AUDIO_SAMPLE_RATE *
+AUDIO_CHANNELS *
+AUDIO_BYTES_PER_SAMPLE *
+AUDIO_CHUNK_MS / 1000;
 
 const AUDIO_BUFFER_MAX =
 AUDIO_SAMPLE_RATE *
 AUDIO_CHANNELS *
 AUDIO_BYTES_PER_SAMPLE *
-0.2;
-
-const AUDIO_CHUNK_SIZE = Math.floor(
-AUDIO_SAMPLE_RATE *
-AUDIO_CHANNELS *
-AUDIO_BYTES_PER_SAMPLE *
-0.02
-);
+0.15;
 
 // =====================================================
 // NETWORK
@@ -58,6 +61,7 @@ let ffmpeg = null;
 
 let ffmpegGeneration = 0;
 let restartTimer = null;
+let watchdogTimer = null;
 
 // =====================================================
 // VIDEO BUFFER
@@ -65,6 +69,8 @@ let restartTimer = null;
 
 let latestFrame = null;
 let jpegBuffer = Buffer.alloc(0);
+
+let lastVideoFrameTime = 0;
 
 const JPEG_START = Buffer.from([0xff, 0xd8]);
 const JPEG_END = Buffer.from([0xff, 0xd9]);
@@ -222,6 +228,7 @@ return result;
 function clearVideoBuffer() {
 latestFrame = null;
 jpegBuffer = Buffer.alloc(0);
+lastVideoFrameTime = 0;
 }
 
 function clearAudioBuffer() {
@@ -231,6 +238,17 @@ audioBuffer = Buffer.alloc(0);
 function clearAllBuffers() {
 clearVideoBuffer();
 clearAudioBuffer();
+}
+
+// =====================================================
+// STOP WATCHDOG
+// =====================================================
+
+function stopWatchdog() {
+if (watchdogTimer) {
+clearInterval(watchdogTimer);
+watchdogTimer = null;
+}
 }
 
 // =====================================================
@@ -245,8 +263,9 @@ clearTimeout(restartTimer);
 restartTimer = null;
 }
 
-const oldFFmpeg = ffmpeg;
+stopWatchdog();
 
+const oldFFmpeg = ffmpeg;
 ffmpeg = null;
 
 if (clearChannel) {
@@ -268,7 +287,95 @@ clearAllBuffers();
 }
 
 // =====================================================
-// START FFMPEG PROCESS
+// SCHEDULE RESTART
+// =====================================================
+
+function scheduleRestart(channel, generation) {
+if (
+generation !== ffmpegGeneration ||
+!currentChannel ||
+currentChannel.id !== channel.id
+) {
+return;
+}
+
+if (restartTimer) {
+return;
+}
+
+console.log(
+"FFmpeg thử kết nối lại sau ${FFMPEG_RESTART_DELAY / 1000}s"
+);
+
+restartTimer = setTimeout(() => {
+restartTimer = null;
+
+if (
+  generation !== ffmpegGeneration ||
+  !currentChannel ||
+  currentChannel.id !== channel.id ||
+  ffmpeg
+) {
+  return;
+}
+
+console.log("ĐANG KẾT NỐI LẠI IPTV...");
+
+launchFFmpeg(channel);
+
+}, FFMPEG_RESTART_DELAY);
+}
+
+// =====================================================
+// FFMPEG WATCHDOG
+// =====================================================
+
+function startWatchdog(channel, generation) {
+stopWatchdog();
+
+watchdogTimer = setInterval(() => {
+if (
+generation !== ffmpegGeneration ||
+!ffmpeg ||
+ffmpeg.exitCode !== null
+) {
+return;
+}
+
+if (!lastVideoFrameTime) {
+  return;
+}
+
+const elapsed =
+  Date.now() - lastVideoFrameTime;
+
+if (elapsed > FRAME_TIMEOUT) {
+  console.log(
+    "VIDEO TIMEOUT:",
+    elapsed,
+    "ms"
+  );
+
+  const old = ffmpeg;
+
+  ffmpeg = null;
+
+  stopWatchdog();
+
+  clearAllBuffers();
+
+  try {
+    old.kill("SIGKILL");
+  } catch {}
+
+  scheduleRestart(channel, generation);
+}
+
+}, 5000);
+}
+
+// =====================================================
+// START FFMPEG
 // =====================================================
 
 function launchFFmpeg(channel) {
@@ -289,11 +396,11 @@ const args = [
 "-hide_banner",
 "-loglevel", "warning",
 
-// INPUT
+// INPUT THREAD
 "-thread_queue_size", "512",
 "-threads", "2",
 
-// HTTP / HLS RECONNECT
+// NETWORK RECONNECT
 "-reconnect", "1",
 "-reconnect_streamed", "1",
 "-reconnect_at_eof", "1",
@@ -301,10 +408,11 @@ const args = [
 "-rw_timeout", "15000000",
 "-user_agent", "Mozilla/5.0",
 
-// TIMESTAMP / CORRUPT PACKETS
+// TIMESTAMP / PACKETS
 "-fflags", "+genpts+discardcorrupt",
 "-err_detect", "ignore_err",
 
+// INPUT
 "-i", channel.url,
 
 // =============================================
@@ -327,7 +435,7 @@ const args = [
 "pipe:1",
 
 // =============================================
-// OUTPUT 2: AUDIO PCM
+// OUTPUT 2: AUDIO PCM U8
 // =============================================
 
 "-map", "0:a:0?",
@@ -336,11 +444,12 @@ const args = [
 "-ac", String(AUDIO_CHANNELS),
 "-ar", String(AUDIO_SAMPLE_RATE),
 
-"-c:a", "pcm_s16le",
+"-c:a", "pcm_u8",
 "-threads:a", "1",
 
 "-flush_packets", "1",
-"-f", "s16le",
+
+"-f", "u8",
 "pipe:3"
 
 ];
@@ -372,6 +481,10 @@ return false;
 
 ffmpeg = processFFmpeg;
 
+lastVideoFrameTime = Date.now();
+
+startWatchdog(channel, generation);
+
 // =================================================
 // STDERR
 // =================================================
@@ -393,7 +506,7 @@ if (message) {
 });
 
 // =================================================
-// VIDEO STREAM - LOW LATENCY JPEG PARSER
+// VIDEO JPEG PARSER
 // =================================================
 
 processFFmpeg.stdout.on("data", chunk => {
@@ -413,7 +526,8 @@ while (jpegBuffer.length >= 4) {
   const start = jpegBuffer.indexOf(JPEG_START);
 
   if (start === -1) {
-    const last = jpegBuffer[jpegBuffer.length - 1];
+    const last =
+      jpegBuffer[jpegBuffer.length - 1];
 
     jpegBuffer = last === 0xff
       ? Buffer.from([0xff])
@@ -426,7 +540,10 @@ while (jpegBuffer.length >= 4) {
     jpegBuffer = jpegBuffer.subarray(start);
   }
 
-  const end = jpegBuffer.indexOf(JPEG_END, 2);
+  const end = jpegBuffer.indexOf(
+    JPEG_END,
+    2
+  );
 
   if (end === -1) {
     if (jpegBuffer.length > MAX_JPEG_BUFFER) {
@@ -464,19 +581,19 @@ while (jpegBuffer.length >= 4) {
     continue;
   }
 
-  // CHỈ GIỮ FRAME MỚI NHẤT
+  // FRAME MỚI NHẤT
+  const now = Date.now();
+
   latestFrame = {
     data: jpeg,
-    time: Date.now(),
+    time: now,
     generation
   };
+
+  lastVideoFrameTime = now;
 }
 
 });
-
-// =================================================
-// VIDEO PIPE ERROR
-// =================================================
 
 processFFmpeg.stdout.on("error", error => {
 if (generation === ffmpegGeneration) {
@@ -488,7 +605,7 @@ error.message
 });
 
 // =================================================
-// AUDIO STREAM
+// AUDIO PCM U8
 // =================================================
 
 processFFmpeg.stdio[3].on("data", chunk => {
@@ -504,24 +621,14 @@ audioBuffer = Buffer.concat([
   chunk
 ]);
 
-// GIỚI HẠN AUDIO 200MS
+// GIỮ TỐI ĐA 150MS
 if (audioBuffer.length > AUDIO_BUFFER_MAX) {
-  let start =
-    audioBuffer.length - AUDIO_BUFFER_MAX;
-
-  // Giữ số byte chẵn cho PCM 16-bit
-  if (start % 2 !== 0) {
-    start++;
-  }
-
-  audioBuffer = audioBuffer.subarray(start);
+  audioBuffer = audioBuffer.subarray(
+    audioBuffer.length - AUDIO_BUFFER_MAX
+  );
 }
 
 });
-
-// =================================================
-// AUDIO PIPE ERROR
-// =================================================
 
 processFFmpeg.stdio[3].on("error", error => {
 if (generation === ffmpegGeneration) {
@@ -541,15 +648,12 @@ if (generation !== ffmpegGeneration) {
 return;
 }
 
-console.log("======================================");
-console.log("FFMPEG PROCESS ERROR");
-console.log(error.message);
-console.log("======================================");
+console.log("FFMPEG PROCESS ERROR:", error.message);
 
 });
 
 // =================================================
-// PROCESS CLOSE / AUTO RESTART
+// PROCESS CLOSE
 // =================================================
 
 processFFmpeg.on("close", (code, signal) => {
@@ -569,37 +673,11 @@ console.log("======================================");
 
 ffmpeg = null;
 
+stopWatchdog();
+
 clearAllBuffers();
 
-if (
-  currentChannel &&
-  generation === ffmpegGeneration
-) {
-  console.log(
-    `FFmpeg thử lại sau ${FFMPEG_RESTART_DELAY / 1000}s`
-  );
-
-  if (restartTimer) {
-    clearTimeout(restartTimer);
-  }
-
-  restartTimer = setTimeout(() => {
-    restartTimer = null;
-
-    if (
-      generation !== ffmpegGeneration ||
-      !currentChannel ||
-      ffmpeg
-    ) {
-      return;
-    }
-
-    console.log("ĐANG KẾT NỐI LẠI IPTV...");
-
-    launchFFmpeg(currentChannel);
-
-  }, FFMPEG_RESTART_DELAY);
-}
+scheduleRestart(channel, generation);
 
 });
 
@@ -697,10 +775,16 @@ audio: "/audio",
 
 format: {
   video: `${WIDTH}x${HEIGHT} ${FPS}fps`,
-  audio: "PCM S16LE",
+
+  audio: "PCM U8",
+
   sampleRate: AUDIO_SAMPLE_RATE,
+
   channels: AUDIO_CHANNELS,
-  bits: 16
+
+  bits: AUDIO_BITS,
+
+  bitrate: 128000
 }
 
 });
@@ -720,7 +804,7 @@ message: "Đã dừng phát"
 });
 
 // =====================================================
-// VIDEO MJPEG
+// VIDEO MJPEG STREAM
 // =====================================================
 
 app.get("/stream", (req, res) => {
@@ -767,7 +851,6 @@ if (!currentChannel || !ffmpeg) {
   return;
 }
 
-// KHÔNG TẠO HÀNG ĐỢI KHI CLIENT CHẬM
 if (waitingForDrain) {
   return;
 }
@@ -786,7 +869,6 @@ if (frame.time === lastFrameTime) {
   return;
 }
 
-// LUÔN LẤY FRAME MỚI NHẤT
 lastFrameTime = frame.time;
 
 const header = Buffer.from(
@@ -843,7 +925,7 @@ cleanup();
 });
 
 // =====================================================
-// AUDIO PCM
+// AUDIO PCM U8 STREAM
 // =====================================================
 
 app.get("/audio", (req, res) => {
@@ -858,7 +940,7 @@ res.setHeader(
 "application/octet-stream"
 );
 
-res.setHeader("X-Audio-Codec", "PCM_S16LE");
+res.setHeader("X-Audio-Codec", "PCM_U8");
 
 res.setHeader(
 "X-Audio-Sample-Rate",
@@ -870,7 +952,10 @@ res.setHeader(
 String(AUDIO_CHANNELS)
 );
 
-res.setHeader("X-Audio-Bits", "16");
+res.setHeader(
+"X-Audio-Bits",
+String(AUDIO_BITS)
+);
 
 res.setHeader(
 "Cache-Control",
@@ -909,17 +994,14 @@ if (audioBuffer.length < AUDIO_CHUNK_SIZE) {
   return;
 }
 
-const chunkSize =
-  AUDIO_CHUNK_SIZE -
-  (AUDIO_CHUNK_SIZE % 2);
-
+// ĐỌC 20MS AUDIO
 const chunk = audioBuffer.subarray(
   0,
-  chunkSize
+  AUDIO_CHUNK_SIZE
 );
 
 audioBuffer = audioBuffer.subarray(
-  chunkSize
+  AUDIO_CHUNK_SIZE
 );
 
 try {
@@ -932,7 +1014,7 @@ try {
   cleanup();
 }
 
-}, 20);
+}, AUDIO_CHUNK_MS);
 
 function cleanup() {
 if (closed) return;
@@ -1010,11 +1092,13 @@ video: {
 },
 
 audio: {
-  codec: "PCM S16LE",
+  codec: "PCM_U8",
   sampleRate: AUDIO_SAMPLE_RATE,
   channels: AUDIO_CHANNELS,
-  bits: 16,
-  chunkMs: 20,
+  bits: AUDIO_BITS,
+  bitrate: 128000,
+  chunkMs: AUDIO_CHUNK_MS,
+  bufferMs: 150,
   endpoint: "/audio"
 }
 
@@ -1030,7 +1114,7 @@ console.log("");
 
 console.log("======================================");
 console.log("ESP32 IPTV SERVER");
-console.log("LOW LATENCY / LATEST FRAME");
+console.log("LOW LATENCY MODE");
 console.log("======================================");
 
 console.log("Port: ${PORT}");
@@ -1042,11 +1126,15 @@ console.log(
 console.log("Video: MJPEG");
 
 console.log(
-"Audio: PCM ${AUDIO_SAMPLE_RATE}Hz Mono 16-bit"
+"Audio: PCM U8 ${AUDIO_SAMPLE_RATE}Hz Mono"
 );
 
-console.log("Frame cache: 1 frame");
-console.log("Audio cache: ~200ms");
+console.log("Audio: 8-bit unsigned");
+console.log("Audio bitrate: 128 kbps");
+
+console.log("Video buffer: 1 latest frame");
+console.log("Audio buffer: 150ms");
+
 console.log("Disk cache: OFF");
 console.log("Auto restart: ON");
 console.log("Web UI: OFF");
@@ -1068,6 +1156,7 @@ console.log("======================================");
 console.log("SERVER READY");
 
 console.log("Channels:", channels.length);
+
 console.log("Chưa phát kênh nào.");
 
 console.log(

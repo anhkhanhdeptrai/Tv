@@ -36,14 +36,14 @@ const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
-  0.5;
+  0.3;
 
 // 20 ms audio mỗi lần gửi
 const AUDIO_CHUNK_SIZE =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
-  0.03;
+  0.025;
 
 // =====================================================
 // NETWORK

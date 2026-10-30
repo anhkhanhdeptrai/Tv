@@ -1,21 +1,3 @@
-EXTINF:-1 tvg-id="VTV1.vn@HD",VTV1 HD (720p)
-https://dethich.pw/vtv1/index.m3u8
-#EXTINF:-1 tvg-id="VTV2.vn@HD",VTV2 HD (720p)
-https://dethich.pw/vtv2/index.m3u8
-#EXTINF:-1 tvg-id="VTV3.vn@HD",VTV3 HD (720p)
-https://dethich.pw/vtv3/index.m3u8
-#EXTINF:-1 tvg-id="VTV4.vn@HD",VTV4 HD (720p)
-https://dethich.pw/vtv4/index.m3u8
-#EXTINF:-1 tvg-id="VTV5.vn@HD",VTV5 HD (720p)
-https://dethich.pw/vtv5/index.m3u8
-#EXTINF:-1 tvg-id="VTV6.vn@HD",VTV6 (720p)
-https://dethich.pw/vtv6/index.m3u8
-#EXTINF:-1 tvg-id="VTV7.vn@HD",VTV7 HD (720p)
-https://dethich.pw/vtv7/index.m3u8
-#EXTINF:-1 tvg-id="VTV8.vn@HD",VTV8 HD (720p)
-https://dethich.pw/vtv8/index.m3u8
-#EXTINF:-1 tvg-id="VTV9.vn@HD",VTV9 HD (720p)
-https://dethich.pw/vtv9/index.m3u8
 #EXTINF:-1 tvg-id="VTV10.vn@HD",VTV10 (720p)
 https://dethich.pw/vtv10/index.m3u8
 #EXTINF:-1 tvg-id="HTVCFamily.vn@SD",HTVC Family (720p)

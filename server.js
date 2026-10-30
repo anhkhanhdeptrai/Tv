@@ -52,12 +52,12 @@ const AUDIO_BUFFER_MAX =
 // =====================================================
 
 const M3U_TIMEOUT = 15000;
+
 const FFMPEG_RESTART_DELAY = 3000;
+const RESTART_DELAY_720P = 5000;
 
 const NETWORK_TIMEOUT_NORMAL = 15000000;
 const NETWORK_TIMEOUT_720P = 60000000;
-
-const RESTART_DELAY_720P = 5000;
 
 // =====================================================
 // STATE
@@ -453,43 +453,23 @@ function launchFFmpeg(channel) {
         "-threads", "2",
 
         // =============================================
-        // HTTP NETWORK RECONNECT
+        // NETWORK RECONNECT
+        // Tương thích FFmpeg cũ
         // =============================================
 
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_at_eof", "1",
-
-        "-reconnect_on_network_error", "1",
-        "-reconnect_on_http_error", "5xx,408,429",
-
-        "-reconnect_max_retries", "10",
-        "-reconnect_delay_max", "10",
+        "-reconnect_delay_max", "5",
 
         "-rw_timeout",
         String(networkTimeout),
 
         "-user_agent", "Mozilla/5.0",
 
-        // =============================================
-        // TIMESTAMP / CORRUPT PACKET
-        // =============================================
-
+        // TIMESTAMP
         "-fflags", "+genpts+discardcorrupt",
         "-err_detect", "ignore_err",
-
-        // =============================================
-        // HLS RETRY - CHỈ RIÊNG 720P
-        // Đặt trước -i vì đây là input options
-        // =============================================
-
-        ...(special720p
-            ? [
-                "-max_reload", "1000",
-                "-m3u8_hold_counters", "1000",
-                "-seg_max_retry", "5"
-            ]
-            : []),
 
         // =============================================
         // INPUT
@@ -722,6 +702,7 @@ function launchFFmpeg(channel) {
             chunk
         ]);
 
+        // GIỮ TỐI ĐA 150MS
         if (audioBuffer.length > AUDIO_BUFFER_MAX) {
             audioBuffer = audioBuffer.subarray(
                 audioBuffer.length - AUDIO_BUFFER_MAX
@@ -1208,7 +1189,7 @@ app.listen(PORT, "0.0.0.0", async () => {
 
     console.log("======================================");
     console.log("ESP32 IPTV SERVER");
-    console.log("720P HLS RETRY MODE");
+    console.log("720P COMPATIBILITY MODE");
     console.log("======================================");
 
     console.log(`Port: ${PORT}`);
@@ -1232,8 +1213,9 @@ app.listen(PORT, "0.0.0.0", async () => {
     console.log("720p readrate: OFF");
     console.log("720p watchdog: 75 seconds");
     console.log("720p network timeout: 60 seconds");
-    console.log("720p HLS segment retry: ON");
+    console.log("720p HLS retry: AUTO");
 
+    console.log("FFmpeg reconnect: COMPATIBILITY MODE");
     console.log("Other channels: Original mode");
 
     console.log("Disk cache: OFF");

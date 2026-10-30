@@ -1,4 +1,3 @@
-JavaScript
 
 const express = require("express");
 const { spawn } = require("child_process");

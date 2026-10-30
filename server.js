@@ -22,13 +22,13 @@ const MAX_JPEG_BUFFER = 1024 * 1024;
 const FRAME_TIMEOUT = 15000;
 
 // =====================================================
-// AUDIO CONFIG - LOW LOAD PCM U8
+// AUDIO CONFIG - LOW LOAD PCM S16LE
 // =====================================================
 
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
-const AUDIO_BITS = 8;
-const AUDIO_BYTES_PER_SAMPLE = 1;
+const AUDIO_BITS = 16;
+const AUDIO_BYTES_PER_SAMPLE = 2;
 
 const AUDIO_CHUNK_MS = 20;
 
@@ -435,7 +435,7 @@ const args = [
 "pipe:1",
 
 // =============================================
-// OUTPUT 2: AUDIO PCM U8
+// OUTPUT 2: AUDIO PCM S16LE
 // =============================================
 
 "-map", "0:a:0?",
@@ -444,12 +444,12 @@ const args = [
 "-ac", String(AUDIO_CHANNELS),
 "-ar", String(AUDIO_SAMPLE_RATE),
 
-"-c:a", "pcm_u8",
+"-c:a", "pcm_s16le",
 "-threads:a", "1",
 
 "-flush_packets", "1",
 
-"-f", "u8",
+"-f", "s16le",
 "pipe:3"
 
 ];
@@ -605,7 +605,7 @@ error.message
 });
 
 // =================================================
-// AUDIO PCM U8
+// AUDIO PCM S16LE
 // =================================================
 
 processFFmpeg.stdio[3].on("data", chunk => {
@@ -776,7 +776,7 @@ audio: "/audio",
 format: {
   video: `${WIDTH}x${HEIGHT} ${FPS}fps`,
 
-  audio: "PCM U8",
+  audio: "PCM S16LE",
 
   sampleRate: AUDIO_SAMPLE_RATE,
 
@@ -925,7 +925,7 @@ cleanup();
 });
 
 // =====================================================
-// AUDIO PCM U8 STREAM
+// AUDIO PCM S16LE STREAM
 // =====================================================
 
 app.get("/audio", (req, res) => {
@@ -940,7 +940,7 @@ res.setHeader(
 "application/octet-stream"
 );
 
-res.setHeader("X-Audio-Codec", "PCM_U8");
+res.setHeader("X-Audio-Codec", "PCM_S16LE");
 
 res.setHeader(
 "X-Audio-Sample-Rate",
@@ -1092,11 +1092,11 @@ video: {
 },
 
 audio: {
-  codec: "PCM_U8",
+  codec: "PCM_S16LE",
   sampleRate: AUDIO_SAMPLE_RATE,
   channels: AUDIO_CHANNELS,
   bits: AUDIO_BITS,
-  bitrate: 128000,
+  bitrate: 256000,
   chunkMs: AUDIO_CHUNK_MS,
   bufferMs: 150,
   endpoint: "/audio"
@@ -1126,11 +1126,11 @@ console.log(
 console.log("Video: MJPEG");
 
 console.log(
-"Audio: PCM U8 ${AUDIO_SAMPLE_RATE}Hz Mono"
+"Audio: PCM S16LE ${AUDIO_SAMPLE_RATE}Hz Mono"
 );
 
-console.log("Audio: 8-bit unsigned");
-console.log("Audio bitrate: 128 kbps");
+console.log("Audio: 16-bit signed PCM");
+console.log("Audio bitrate: 256 kbps");
 
 console.log("Video buffer: 1 latest frame");
 console.log("Audio buffer: 150ms");

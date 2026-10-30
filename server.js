@@ -740,7 +740,10 @@ app.get("/audio", (req, res) => {
 // =====================================================
 
 app.get("/api/channels", (req, res) => {
-  res.json(channels);
+  res.json({
+    success: true,
+    channels
+  });
 });
 
 // =====================================================

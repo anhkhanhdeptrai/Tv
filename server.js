@@ -11,8 +11,10 @@ app.use(express.json());
 // CONFIG
 // =====================================================
 
-const M3U_URL =
-  "https://iptv-org.github.io/iptv/countries/vn.m3u";
+const M3U_URLS = [
+  "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/vn.m3u",
+  "https://iptv-org.github.io/iptv/countries/vn.m3u"
+];
 
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 180;
@@ -94,7 +96,6 @@ let manuallyStopped = true;
 // M3U PARSER
 // =====================================================
 
-
 function parseM3U(content) {
   const lines = content.split(/\r?\n/);
   const result = [];
@@ -116,26 +117,15 @@ function parseM3U(content) {
 
     const url = line;
 
-    if (!url.startsWith("http")) {
+    const isStreamUrl = /^(https?|rtsp|rtmp|udp):\/\//i.test(url);
+    if (!isStreamUrl) {
       currentInfo = null;
       continue;
     }
 
-    // Lấy tên kênh
     let name = currentInfo.split(",").pop().trim();
 
     if (!name) name = "Unknown channel";
-
-    // Ghép thông tin EXTINF và URL để nhận diện độ phân giải
-    const info = currentInfo + " " + name + " " + url;
-
-    // Chỉ lấy kênh 720p
-    const is720p = /\b720p\b/i.test(info);
-
-    if (!is720p) {
-      currentInfo = null;
-      continue;
-    }
 
     const groupMatch =
       currentInfo.match(/group-title="([^"]*)"/i);
@@ -152,14 +142,11 @@ function parseM3U(content) {
       group: groupMatch ? groupMatch[1] : "",
       logo: logoMatch ? logoMatch[1] : "",
       tvgId: idMatch ? idMatch[1] : "",
-      url,
-      resolution: "720p"
+      url
     });
 
     currentInfo = null;
   }
-
-  console.log("[M3U] 720p CHANNELS:", result.length);
 
   return result;
 }
@@ -172,23 +159,40 @@ async function loadChannels() {
   try {
     console.log("[M3U] Loading playlist...");
 
-    const response = await fetch(M3U_URL, {
-      headers: {
-        "User-Agent": "Mozilla/5.0"
-      },
-      signal: AbortSignal.timeout(20000)
-    });
+    let lastError = null;
+    let content = "";
+    let chosenUrl = "";
 
-    if (!response.ok) {
-      throw new Error("HTTP " + response.status);
+    for (const url of M3U_URLS) {
+      try {
+        const response = await fetch(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0"
+          },
+          signal: AbortSignal.timeout(20000)
+        });
+
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+
+        content = await response.text();
+        chosenUrl = url;
+        break;
+      } catch (error) {
+        lastError = error;
+        console.warn("[M3U] Try failed:", url, error.message);
+      }
     }
 
-    const content = await response.text();
+    if (!content) {
+      throw lastError || new Error("No playlist available");
+    }
 
     channels = parseM3U(content);
 
     console.log("--------------------------------");
-    console.log("M3U URL:", M3U_URL);
+    console.log("M3U URL:", chosenUrl);
     console.log("TOTAL CHANNELS:", channels.length);
     console.log("--------------------------------");
 

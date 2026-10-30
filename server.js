@@ -15,7 +15,7 @@ const M3U_URL =
 
 const WIDTH = 340;
 const HEIGHT = 230;
-const FPS = 10;
+const FPS = 12;
 
 // Chỉ giữ 2 frame mới nhất.
 // Không tích lũy frame cũ.

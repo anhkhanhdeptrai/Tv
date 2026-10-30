@@ -2,1331 +2,1102 @@ const express = require("express");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
+const https = require("https");
+const http = require("http");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ======================================================
-// CONFIG
-// ======================================================
+// =====================================================
+// IPTV-ORG
+// =====================================================
 
-const PLAYLIST_URL =
+const M3U_URL =
   "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/vn.m3u";
+
+// =====================================================
+// CONFIG
+// =====================================================
 
 const WIDTH = 320;
 const HEIGHT = 240;
-const FPS = 10;
 
-const FRAME_BUFFER_SIZE = 3;
-const MAX_AUDIO_BUFFER = 256 * 1024;
+const FPS = 14;
+
+const DELAY_SECONDS = 1;
+const BUFFER_SECONDS = 12;
+
+const MAX_BUFFER_FRAMES =
+  FPS * BUFFER_SECONDS;
 
 const HLS_TIME = 2;
-const HLS_LIST = 6;
+const HLS_LIST = 8;
 
-const TMP_ROOT = path.join(os.tmpdir(), "iptv-server");
+// =====================================================
+// HLS
+// =====================================================
 
-fs.mkdirSync(TMP_ROOT, {
-  recursive: true
-});
+const HLS_DIR =
+  path.join(__dirname, "hls");
 
-// ======================================================
+if (!fs.existsSync(HLS_DIR)) {
+  fs.mkdirSync(HLS_DIR, {
+    recursive: true
+  });
+}
+
+// =====================================================
+// DOWNLOAD M3U
+// =====================================================
+
+function downloadM3U(url) {
+
+  return new Promise((resolve, reject) => {
+
+    const protocol =
+      url.startsWith("https")
+        ? https
+        : http;
+
+    const request =
+      protocol.get(
+        url,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0"
+          }
+        },
+        response => {
+
+          let data = "";
+
+          response.setEncoding("utf8");
+
+          response.on(
+            "data",
+            chunk => {
+              data += chunk;
+            }
+          );
+
+          response.on(
+            "end",
+            () => {
+
+              if (
+                response.statusCode < 200 ||
+                response.statusCode >= 300
+              ) {
+
+                reject(
+                  new Error(
+                    "M3U HTTP " +
+                    response.statusCode
+                  )
+                );
+
+                return;
+              }
+
+              resolve(data);
+            }
+          );
+        }
+      );
+
+    request.setTimeout(
+      15000,
+      () => {
+        request.destroy(
+          new Error(
+            "M3U timeout"
+          )
+        );
+      }
+    );
+
+    request.on(
+      "error",
+      reject
+    );
+  });
+}
+
+// =====================================================
+// PARSE M3U
+// =====================================================
+
+function parseM3U(text) {
+
+  const lines =
+    text
+      .split(/\r?\n/)
+      .map(x => x.trim())
+      .filter(Boolean);
+
+  const result = [];
+
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
+
+    const line = lines[i];
+
+    if (
+      !line.startsWith("#EXTINF")
+    ) {
+      continue;
+    }
+
+    let name =
+      line
+        .substring(
+          line.lastIndexOf(",") + 1
+        )
+        .trim();
+
+    const tvgId =
+      (
+        line.match(
+          /tvg-id="([^"]*)"/i
+        ) || []
+      )[1] || "";
+
+    const tvgName =
+      (
+        line.match(
+          /tvg-name="([^"]*)"/i
+        ) || []
+      )[1] || "";
+
+    const logo =
+      (
+        line.match(
+          /tvg-logo="([^"]*)"/i
+        ) || []
+      )[1] || "";
+
+    const group =
+      (
+        line.match(
+          /group-title="([^"]*)"/i
+        ) || []
+      )[1] || "";
+
+    let url = "";
+
+    for (
+      let j = i + 1;
+      j < lines.length;
+      j++
+    ) {
+
+      if (
+        !lines[j].startsWith("#")
+      ) {
+
+        url = lines[j];
+
+        break;
+      }
+    }
+
+    if (!url) {
+      continue;
+    }
+
+    if (!name) {
+      name =
+        tvgName ||
+        tvgId ||
+        `Channel ${result.length + 1}`;
+    }
+
+    // =============================================
+    // Bỏ Geo-blocked
+    // =============================================
+
+    if (
+      line.includes("[Geo-blocked]") ||
+      name.includes("[Geo-blocked]")
+    ) {
+      continue;
+    }
+
+    // =============================================
+    // Bỏ DASH
+    // =============================================
+
+    if (
+      url.includes(".mpd")
+    ) {
+      continue;
+    }
+
+    result.push({
+
+      id:
+        String(result.length),
+
+      name,
+
+      tvgId,
+
+      logo,
+
+      group,
+
+      url,
+
+      // Không check trước
+      checking: false,
+
+      available: null,
+
+      error: null
+    });
+  }
+
+  return result;
+}
+
+// =====================================================
 // GLOBAL
-// ======================================================
+// =====================================================
 
 let channels = [];
 
-let currentIndex = -1;
 let currentChannel = null;
 
-let sessionId = 0;
+let ffmpeg = null;
 
-let ffmpegVideo = null;
-let ffmpegHLS = null;
+let ffmpegGeneration = 0;
+
 let ffmpegAudio = null;
 
-let frameBuffer = [];
-let audioQueue = [];
+let ffmpegAudioGeneration = 0;
 
-let mjpegClients = new Set();
+const frames = [];
 
-let mjpegTimer = null;
-let statsTimer = null;
+const audioQueue = [];
 
-let stats = {
-  ffmpegFrame: 0,
-  ffmpegFPS: 0,
-  ffmpegSpeed: 0,
+let audioQueueBytes = 0;
 
-  mjpegFPS: 0,
-  mjpegTotalFrames: 0,
+const MAX_AUDIO_QUEUE_BYTES =
+  2 * 1024 * 1024;
 
-  bufferFrames: 0,
-  bufferSeconds: 0,
+let jpegBuffer =
+  Buffer.alloc(0);
 
-  audioBytes: 0
-};
+const JPEG_START =
+  Buffer.from([
+    0xff,
+    0xd8
+  ]);
 
-let mjpegFrameCounter = 0;
-let lastMjpegStatTime = Date.now();
+const JPEG_END =
+  Buffer.from([
+    0xff,
+    0xd9
+  ]);
 
+// =====================================================
+// CLEAR HLS
+// =====================================================
 
-// ======================================================
-// PLAYLIST
-// ======================================================
+function clearHLS() {
 
-async function loadPlaylist() {
-  console.log("==========================================");
-  console.log("LOAD IPTV PLAYLIST");
-  console.log("==========================================");
-
-  const response = await fetch(PLAYLIST_URL);
-
-  if (!response.ok) {
-    throw new Error(
-      `Cannot load playlist: HTTP ${response.status}`
-    );
+  if (!fs.existsSync(HLS_DIR)) {
+    return;
   }
 
-  const text = await response.text();
+  for (
+    const file of
+    fs.readdirSync(HLS_DIR)
+  ) {
 
-  const lines = text.split(/\r?\n/);
+    try {
 
-  channels = [];
+      fs.unlinkSync(
+        path.join(
+          HLS_DIR,
+          file
+        )
+      );
 
-  let currentInfo = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-
-    if (!line) {
-      continue;
-    }
-
-    // ------------------------------------------
-    // EXTINF
-    // ------------------------------------------
-
-    if (line.startsWith("#EXTINF:")) {
-      const comma = line.indexOf(",");
-
-      let name = "";
-
-      if (comma !== -1) {
-        name = line.substring(comma + 1).trim();
-      }
-
-      const tvgIdMatch =
-        line.match(/tvg-id="([^"]*)"/i);
-
-      const groupMatch =
-        line.match(/group-title="([^"]*)"/i);
-
-      const logoMatch =
-        line.match(/tvg-logo="([^"]*)"/i);
-
-      currentInfo = {
-        name: name || `Channel ${channels.length + 1}`,
-
-        tvgId:
-          tvgIdMatch ? tvgIdMatch[1] : "",
-
-        group:
-          groupMatch ? groupMatch[1] : "",
-
-        logo:
-          logoMatch ? logoMatch[1] : ""
-      };
-
-      continue;
-    }
-
-    // ------------------------------------------
-    // STREAM URL
-    // ------------------------------------------
-
-    if (
-      !line.startsWith("#") &&
-      currentInfo
-    ) {
-      channels.push({
-        index: channels.length,
-
-        name: currentInfo.name,
-
-        tvgId: currentInfo.tvgId,
-
-        group: currentInfo.group,
-
-        logo: currentInfo.logo,
-
-        url: line,
-
-        live: null,
-
-        error: null
-      });
-
-      currentInfo = null;
-    }
+    } catch {}
   }
-
-  console.log(
-    `Loaded ${channels.length} channels`
-  );
-
-  console.log(
-    "NO CHANNEL CHECKING"
-  );
-
-  console.log("==========================================");
 }
 
+// =====================================================
+// STOP FFMPEG
+// =====================================================
 
-// ======================================================
-// CLEANUP OLD SESSION
-// ======================================================
+function stopFFmpeg() {
 
-function killProcess(proc) {
-  if (!proc) {
+  if (!ffmpeg) {
     return;
   }
 
   try {
-    proc.kill("SIGKILL");
-  } catch (_) {}
+    ffmpeg.kill("SIGKILL");
+  } catch {}
+
+  ffmpeg = null;
 }
 
+function stopAudioFFmpeg() {
 
-function clearClients() {
-  for (const client of mjpegClients) {
-    try {
-      client.end();
-    } catch (_) {}
+  if (!ffmpegAudio) {
+    audioQueue.length = 0;
+    audioQueueBytes = 0;
+    return;
   }
 
-  mjpegClients.clear();
-}
+  try {
+    ffmpegAudio.kill("SIGKILL");
+  } catch {}
 
-
-function stopCurrentSession() {
-  console.log("Stopping current session...");
-
-  sessionId++;
-
-  killProcess(ffmpegVideo);
-  killProcess(ffmpegHLS);
-  killProcess(ffmpegAudio);
-
-  ffmpegVideo = null;
-  ffmpegHLS = null;
   ffmpegAudio = null;
-
-  frameBuffer = [];
-  audioQueue = [];
-
-  clearClients();
-
-  if (mjpegTimer) {
-    clearInterval(mjpegTimer);
-    mjpegTimer = null;
-  }
-
-  if (statsTimer) {
-    clearInterval(statsTimer);
-    statsTimer = null;
-  }
-
-  stats = {
-    ffmpegFrame: 0,
-    ffmpegFPS: 0,
-    ffmpegSpeed: 0,
-
-    mjpegFPS: 0,
-    mjpegTotalFrames: 0,
-
-    bufferFrames: 0,
-    bufferSeconds: 0,
-
-    audioBytes: 0
-  };
-
-  mjpegFrameCounter = 0;
-  lastMjpegStatTime = Date.now();
+  audioQueue.length = 0;
+  audioQueueBytes = 0;
 }
 
+function queueAudioChunk(chunk) {
 
-// ======================================================
-// NEW HLS DIRECTORY
-// ======================================================
+  if (
+    !chunk ||
+    chunk.length === 0
+  ) {
+    return;
+  }
 
-function createHLSDirectory(mySession) {
-  const dir = path.join(
-    TMP_ROOT,
-    `hls-${mySession}`
+  const audioChunk =
+    Buffer.from(chunk);
+
+  while (
+    audioQueueBytes +
+      audioChunk.length >
+      MAX_AUDIO_QUEUE_BYTES &&
+    audioQueue.length
+  ) {
+
+    const removed =
+      audioQueue.shift();
+
+    audioQueueBytes -=
+      removed.length;
+  }
+
+  audioQueue.push(
+    audioChunk
   );
 
-  fs.rmSync(dir, {
-    recursive: true,
-    force: true
-  });
-
-  fs.mkdirSync(dir, {
-    recursive: true
-  });
-
-  return dir;
+  audioQueueBytes +=
+    audioChunk.length;
 }
 
+// =====================================================
+// START AUDIO FFMPEG
+// =====================================================
 
-// ======================================================
-// MJPEG BROADCAST
-// ======================================================
+function startAudioFFmpeg(channel) {
 
-function startMJPEGBroadcaster(mySession) {
-  if (mjpegTimer) {
-    clearInterval(mjpegTimer);
+  if (
+    !channel ||
+    !channel.url
+  ) {
+    return;
   }
 
-  mjpegTimer = setInterval(() => {
+  ffmpegAudioGeneration++;
 
-    if (mySession !== sessionId) {
-      return;
-    }
+  const generation =
+    ffmpegAudioGeneration;
 
-    if (frameBuffer.length === 0) {
-      return;
-    }
+  stopAudioFFmpeg();
 
-    // ------------------------------------------
-    // CHỈ LẤY FRAME MỚI NHẤT
-    // Không phát frame cũ.
-    // ------------------------------------------
+  ffmpegAudio = spawn(
+    "ffmpeg",
+    [
+      "-hide_banner",
 
-    const frame =
-      frameBuffer[frameBuffer.length - 1];
+      "-loglevel",
+      "warning",
 
-    // Xóa các frame cũ
-    frameBuffer = [frame];
+      "-reconnect",
+      "1",
 
-    const clients =
-      Array.from(mjpegClients);
+      "-reconnect_streamed",
+      "1",
 
-    for (const client of clients) {
-      try {
-        client.res.write(
-          "--frame\r\n"
+      "-reconnect_delay_max",
+      "5",
+
+      "-fflags",
+      "nobuffer",
+
+      "-i",
+      channel.url,
+
+      "-vn",
+
+      "-ac",
+      "1",
+
+      "-ar",
+      "44100",
+
+      "-c:a",
+      "pcm_s16le",
+
+      "-f",
+      "s16le",
+
+      "pipe:1"
+    ]
+  );
+
+  ffmpegAudio.stderr.on(
+    "data",
+    data => {
+
+      const text =
+        data
+          .toString()
+          .trim();
+
+      if (text) {
+        console.log(
+          "[FFmpeg Audio]",
+          text
         );
-
-        client.res.write(
-          "Content-Type: image/jpeg\r\n"
-        );
-
-        client.res.write(
-          "Content-Length: " +
-          frame.data.length +
-          "\r\n\r\n"
-        );
-
-        client.res.write(frame.data);
-
-        client.res.write("\r\n");
-
-      } catch (_) {
-
-        try {
-          client.res.end();
-        } catch (_) {}
-
-        mjpegClients.delete(client);
       }
     }
-
-    stats.mjpegTotalFrames++;
-
-    mjpegFrameCounter++;
-
-    const now = Date.now();
-
-    if (
-      now - lastMjpegStatTime >= 1000
-    ) {
-      stats.mjpegFPS =
-        mjpegFrameCounter /
-        ((now - lastMjpegStatTime) / 1000);
-
-      mjpegFrameCounter = 0;
-
-      lastMjpegStatTime = now;
-    }
-
-    stats.bufferFrames =
-      frameBuffer.length;
-
-    stats.bufferSeconds =
-      frameBuffer.length / FPS;
-
-  }, 1000 / FPS);
-}
-
-
-// ======================================================
-// VIDEO -> MJPEG
-// ======================================================
-
-function startVideo(channel, mySession) {
-
-  console.log("");
-  console.log("==========================================");
-  console.log("START MJPEG");
-  console.log("Channel:", channel.name);
-  console.log("URL:", channel.url);
-  console.log("==========================================");
-
-  const args = [
-    "-hide_banner",
-
-    "-loglevel",
-    "warning",
-
-    // ----------------------------------------
-    // LOW LATENCY
-    // ----------------------------------------
-
-    "-fflags",
-    "nobuffer",
-
-    "-flags",
-    "low_delay",
-
-    "-avioflags",
-    "direct",
-
-    "-analyzeduration",
-    "500k",
-
-    "-probesize",
-    "1M",
-
-    "-rw_timeout",
-    "5000000",
-
-    // ----------------------------------------
-    // INPUT
-    // ----------------------------------------
-
-    "-i",
-    channel.url,
-
-    // ----------------------------------------
-    // VIDEO ONLY
-    // ----------------------------------------
-
-    "-map",
-    "0:v:0",
-
-    "-an",
-
-    // ----------------------------------------
-    // 320x240 / 10 FPS
-    // ----------------------------------------
-
-    "-vf",
-    [
-      `fps=${FPS}`,
-
-      `scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear:force_original_aspect_ratio=decrease`,
-
-      `pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`
-    ].join(","),
-
-    // ----------------------------------------
-    // MJPEG
-    // ----------------------------------------
-
-    "-c:v",
-    "mjpeg",
-
-    "-q:v",
-    "18",
-
-    "-fps_mode",
-    "cfr",
-
-    "-flush_packets",
-    "1",
-
-    "-f",
-    "image2pipe",
-
-    "pipe:1"
-  ];
-
-  ffmpegVideo = spawn(
-    "ffmpeg",
-    args,
-    {
-      stdio: [
-        "ignore",
-        "pipe",
-        "pipe"
-      ]
-    }
   );
 
-  let jpegBuffer = Buffer.alloc(0);
-
-  ffmpegVideo.stdout.on(
+  ffmpegAudio.stdout.on(
     "data",
-    (chunk) => {
+    chunk => {
 
-      if (mySession !== sessionId) {
+      if (
+        generation !==
+        ffmpegAudioGeneration
+      ) {
         return;
       }
 
-      jpegBuffer = Buffer.concat([
-        jpegBuffer,
+      queueAudioChunk(
         chunk
-      ]);
+      );
+    }
+  );
+
+  ffmpegAudio.on(
+    "close",
+    code => {
+
+      if (
+        generation !==
+        ffmpegAudioGeneration
+      ) {
+        return;
+      }
+
+      ffmpegAudio = null;
+
+      setTimeout(
+        () => {
+
+          if (
+            generation ===
+              ffmpegAudioGeneration &&
+            currentChannel
+          ) {
+
+            startAudioFFmpeg(
+              currentChannel
+            );
+          }
+
+        },
+        3000
+      );
+    }
+  );
+}
+
+// =====================================================
+// START FFMPEG
+// =====================================================
+
+function startFFmpeg(channel) {
+
+  ffmpegGeneration++;
+
+  const generation =
+    ffmpegGeneration;
+
+  console.log("");
+  console.log(
+    "======================================"
+  );
+
+  console.log(
+    "ĐANG PHÁT:",
+    channel.name
+  );
+
+  console.log(
+    channel.url
+  );
+
+  console.log(
+    "======================================"
+  );
+
+  stopFFmpeg();
+  stopAudioFFmpeg();
+
+  clearHLS();
+
+  frames.length = 0;
+
+  jpegBuffer =
+    Buffer.alloc(0);
+
+  const playlist =
+    path.join(
+      HLS_DIR,
+      "stream.m3u8"
+    );
+
+  const segment =
+    path.join(
+      HLS_DIR,
+      "seg-%05d.ts"
+    );
+
+  ffmpeg = spawn(
+    "ffmpeg",
+    [
+
+      "-hide_banner",
+
+      "-loglevel",
+      "warning",
+
+      "-reconnect",
+      "1",
+
+      "-reconnect_streamed",
+      "1",
+
+      "-reconnect_delay_max",
+      "5",
+
+      "-fflags",
+      "nobuffer",
+
+      "-i",
+      channel.url,
+
+      // =========================================
+      // HLS VIDEO + AUDIO
+      // =========================================
+
+      "-map",
+      "0:v:0",
+
+      "-map",
+      "0:a:0?",
+
+      "-c:v",
+      "copy",
+
+      "-c:a",
+      "aac",
+
+      "-b:a",
+      "96k",
+
+      "-ar",
+      "44100",
+
+      "-ac",
+      "2",
+
+      "-f",
+      "hls",
+
+      "-hls_time",
+      String(HLS_TIME),
+
+      "-hls_list_size",
+      String(HLS_LIST),
+
+      "-hls_delete_threshold",
+      "4",
+
+      "-hls_flags",
+      "delete_segments+append_list+independent_segments",
+
+      "-hls_segment_filename",
+      segment,
+
+      playlist,
+
+      // =========================================
+      // MJPEG
+      // =========================================
+
+      "-map",
+      "0:v:0",
+
+      "-an",
+
+      "-vf",
+      `fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+
+      "-c:v",
+      "mjpeg",
+
+      "-q:v",
+      "10",
+
+      "-fps_mode",
+      "cfr",
+
+      "-f",
+      "image2pipe",
+
+      "pipe:1"
+    ]
+  );
+
+  startAudioFFmpeg(
+    channel
+  );
+
+  // =========================================
+  // STDERR
+  // =========================================
+
+  ffmpeg.stderr.on(
+    "data",
+    data => {
+
+      const text =
+        data
+          .toString()
+          .trim();
+
+      if (text) {
+
+        console.log(
+          "[FFmpeg]",
+          text
+        );
+      }
+    }
+  );
+
+  // =========================================
+  // MJPEG
+  // =========================================
+
+  ffmpeg.stdout.on(
+    "data",
+    chunk => {
+
+      if (
+        generation !==
+        ffmpegGeneration
+      ) {
+        return;
+      }
+
+      jpegBuffer =
+        Buffer.concat([
+          jpegBuffer,
+          chunk
+        ]);
 
       while (true) {
 
         const start =
           jpegBuffer.indexOf(
-            Buffer.from([0xff, 0xd8])
+            JPEG_START
           );
 
         if (start === -1) {
 
-          // Không để buffer phình
-          if (jpegBuffer.length > 1024 * 1024) {
+          if (
+            jpegBuffer.length >
+            2 * 1024 * 1024
+          ) {
+
             jpegBuffer =
-              jpegBuffer.subarray(
-                jpegBuffer.length - 64 * 1024
-              );
+              Buffer.alloc(0);
           }
 
           break;
         }
 
+        if (start > 0) {
+
+          jpegBuffer =
+            jpegBuffer.slice(
+              start
+            );
+        }
+
         const end =
           jpegBuffer.indexOf(
-            Buffer.from([0xff, 0xd9]),
-            start + 2
+            JPEG_END,
+            2
           );
 
         if (end === -1) {
           break;
         }
 
-        const jpegEnd = end + 2;
-
-        const frame =
-          jpegBuffer.subarray(
-            start,
-            jpegEnd
+        const jpeg =
+          Buffer.from(
+            jpegBuffer.slice(
+              0,
+              end + 2
+            )
           );
 
         jpegBuffer =
-          jpegBuffer.subarray(jpegEnd);
-
-        // ------------------------------------
-        // BUFFER CỰC NHỎ
-        // ------------------------------------
-
-        frameBuffer.push({
-          data: Buffer.from(frame),
-          time: Date.now()
-        });
-
-        while (
-          frameBuffer.length >
-          FRAME_BUFFER_SIZE
-        ) {
-          frameBuffer.shift();
-        }
-
-        stats.bufferFrames =
-          frameBuffer.length;
-      }
-    }
-  );
-
-
-  ffmpegVideo.stderr.on(
-    "data",
-    (data) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      const text =
-        data.toString();
-
-      const fpsMatch =
-        text.match(
-          /fps=\s*([0-9.]+)/
-        );
-
-      const speedMatch =
-        text.match(
-          /speed=\s*([0-9.]+)x/
-        );
-
-      const frameMatch =
-        text.match(
-          /frame=\s*(\d+)/
-        );
-
-      if (fpsMatch) {
-        stats.ffmpegFPS =
-          Number(fpsMatch[1]);
-      }
-
-      if (speedMatch) {
-        stats.ffmpegSpeed =
-          Number(speedMatch[1]);
-      }
-
-      if (frameMatch) {
-        stats.ffmpegFrame =
-          Number(frameMatch[1]);
-      }
-
-      const clean =
-        text.trim();
-
-      if (clean) {
-        console.log(
-          "[FFMPEG VIDEO]",
-          clean
-        );
-      }
-    }
-  );
-
-
-  ffmpegVideo.on(
-    "close",
-    (code, signal) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      console.log(
-        "FFmpeg MJPEG stopped:",
-        code,
-        signal
-      );
-
-      ffmpegVideo = null;
-    }
-  );
-
-
-  ffmpegVideo.on(
-    "error",
-    (err) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      console.error(
-        "FFmpeg MJPEG error:",
-        err.message
-      );
-    }
-  );
-
-
-  startMJPEGBroadcaster(
-    mySession
-  );
-}
-
-
-// ======================================================
-// HLS
-// ======================================================
-
-function startHLS(channel, mySession) {
-
-  const hlsDir =
-    createHLSDirectory(mySession);
-
-  const playlist =
-    path.join(
-      hlsDir,
-      "index.m3u8"
-    );
-
-  const segment =
-    path.join(
-      hlsDir,
-      "segment-%05d.ts"
-    );
-
-  console.log("");
-  console.log("==========================================");
-  console.log("START HLS");
-  console.log("Channel:", channel.name);
-  console.log("==========================================");
-
-  const args = [
-
-    "-hide_banner",
-
-    "-loglevel",
-    "warning",
-
-    // ----------------------------------------
-    // LOW LATENCY
-    // ----------------------------------------
-
-    "-fflags",
-    "nobuffer",
-
-    "-flags",
-    "low_delay",
-
-    "-avioflags",
-    "direct",
-
-    "-reconnect",
-    "1",
-
-    "-reconnect_streamed",
-    "1",
-
-    "-reconnect_delay_max",
-    "2",
-
-    "-rw_timeout",
-    "5000000",
-
-    // ----------------------------------------
-    // INPUT
-    // ----------------------------------------
-
-    "-i",
-    channel.url,
-
-    // ----------------------------------------
-    // VIDEO
-    // KHÔNG ENCODE LẠI
-    // ----------------------------------------
-
-    "-map",
-    "0:v:0",
-
-    "-c:v",
-    "copy",
-
-    // ----------------------------------------
-    // AUDIO
-    // ----------------------------------------
-
-    "-map",
-    "0:a:0?",
-
-    "-c:a",
-    "aac",
-
-    "-b:a",
-    "128k",
-
-    "-ar",
-    "44100",
-
-    "-ac",
-    "2",
-
-    // ----------------------------------------
-    // HLS
-    // ----------------------------------------
-
-    "-f",
-    "hls",
-
-    "-hls_time",
-    String(HLS_TIME),
-
-    "-hls_list_size",
-    String(HLS_LIST),
-
-    "-hls_flags",
-    "delete_segments+append_list+omit_endlist",
-
-    "-hls_segment_filename",
-    segment,
-
-    playlist
-  ];
-
-  ffmpegHLS = spawn(
-    "ffmpeg",
-    args,
-    {
-      stdio: [
-        "ignore",
-        "ignore",
-        "pipe"
-      ]
-    }
-  );
-
-
-  ffmpegHLS.stderr.on(
-    "data",
-    (data) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      const text =
-        data.toString().trim();
-
-      if (text) {
-        console.log(
-          "[FFMPEG HLS]",
-          text
-        );
-      }
-    }
-  );
-
-
-  ffmpegHLS.on(
-    "close",
-    (code, signal) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      console.log(
-        "FFmpeg HLS stopped:",
-        code,
-        signal
-      );
-
-      ffmpegHLS = null;
-    }
-  );
-
-
-  ffmpegHLS.on(
-    "error",
-    (err) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      console.error(
-        "FFmpeg HLS error:",
-        err.message
-      );
-    }
-  );
-}
-
-
-// ======================================================
-// SEPARATE AUDIO PROCESS
-// ======================================================
-
-function startAudio(channel, mySession) {
-
-  console.log(
-    "START AUDIO:",
-    channel.name
-  );
-
-  const args = [
-
-    "-hide_banner",
-
-    "-loglevel",
-    "warning",
-
-    "-reconnect",
-    "1",
-
-    "-reconnect_streamed",
-    "1",
-
-    "-reconnect_delay_max",
-    "5",
-
-    "-fflags",
-    "nobuffer",
-
-    "-i",
-    channel.url,
-
-    "-vn",
-
-    "-ac",
-    "1",
-
-    "-ar",
-    "44100",
-
-    "-c:a",
-    "pcm_s16le",
-
-    "-f",
-    "s16le",
-
-    "pipe:1"
-  ];
-
-  ffmpegAudio = spawn(
-    "ffmpeg",
-    args,
-    {
-      stdio: [
-        "ignore",
-        "pipe",
-        "pipe"
-      ]
-    }
-  );
-
-
-  ffmpegAudio.stdout.on(
-    "data",
-    (chunk) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      audioQueue.push(
-        Buffer.from(chunk)
-      );
-
-      stats.audioBytes +=
-        chunk.length;
-
-      // --------------------------------------
-      // Giới hạn buffer audio
-      // --------------------------------------
-
-      let total = 0;
-
-      for (let i = audioQueue.length - 1; i >= 0; i--) {
-
-        total +=
-          audioQueue[i].length;
+          jpegBuffer.slice(
+            end + 2
+          );
 
         if (
-          total >
-          MAX_AUDIO_BUFFER
+          jpeg.length < 100 ||
+          jpeg[0] !== 0xff ||
+          jpeg[1] !== 0xd8 ||
+          jpeg[jpeg.length - 2] !== 0xff ||
+          jpeg[jpeg.length - 1] !== 0xd9
+        ) {
+          continue;
+        }
+
+        const now =
+          Date.now();
+
+        frames.push({
+          time: now,
+          data: jpeg
+        });
+
+        const oldest =
+          now -
+          BUFFER_SECONDS * 1000;
+
+        while (
+          frames.length &&
+          frames[0].time <
+            oldest
         ) {
 
-          audioQueue =
-            audioQueue.slice(i);
+          frames.shift();
+        }
 
-          break;
+        while (
+          frames.length >
+          MAX_BUFFER_FRAMES
+        ) {
+
+          frames.shift();
         }
       }
     }
   );
 
+  // =========================================
+  // CLOSE
+  // =========================================
 
-  ffmpegAudio.stderr.on(
-    "data",
-    (data) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
-
-      const text =
-        data.toString().trim();
-
-      if (text) {
-        console.log(
-          "[FFMPEG AUDIO]",
-          text
-        );
-      }
-    }
-  );
-
-
-  ffmpegAudio.on(
+  ffmpeg.on(
     "close",
-    (code, signal) => {
-
-      if (mySession !== sessionId) {
-        return;
-      }
+    code => {
 
       console.log(
-        "FFmpeg AUDIO stopped:",
-        code,
-        signal
+        "FFmpeg exited:",
+        code
       );
 
-      ffmpegAudio = null;
-    }
-  );
-
-
-  ffmpegAudio.on(
-    "error",
-    (err) => {
-
-      if (mySession !== sessionId) {
+      if (
+        generation !==
+        ffmpegGeneration
+      ) {
         return;
       }
 
-      console.error(
-        "FFmpeg AUDIO error:",
-        err.message
+      ffmpeg = null;
+
+      setTimeout(
+        () => {
+
+          if (
+            generation ===
+              ffmpegGeneration &&
+            currentChannel
+          ) {
+
+            startFFmpeg(
+              currentChannel
+            );
+          }
+
+        },
+        3000
       );
     }
   );
 }
 
-
-// ======================================================
-// START CHANNEL
-// ======================================================
-
-function startChannel(index) {
-
-  if (
-    index < 0 ||
-    index >= channels.length
-  ) {
-    return false;
-  }
-
-  const channel =
-    channels[index];
-
-  currentIndex = index;
-  currentChannel = channel;
-
-  stopCurrentSession();
-
-  // stopCurrentSession() increments sessionId
-  const mySession = sessionId;
-
-  console.log("");
-  console.log("##########################################");
-  console.log(
-    "CHANNEL:",
-    index,
-    "/",
-    channels.length - 1
-  );
-
-  console.log(
-    "NAME:",
-    channel.name
-  );
-
-  console.log(
-    "URL:",
-    channel.url
-  );
-
-  console.log(
-    "SESSION:",
-    mySession
-  );
-
-  console.log("##########################################");
-  console.log("");
-
-  channel.live = null;
-  channel.error = null;
-
-  startVideo(
-    channel,
-    mySession
-  );
-
-  startHLS(
-    channel,
-    mySession
-  );
-
-  startAudio(
-    channel,
-    mySession
-  );
-
-  return true;
-}
-
-
-// ======================================================
-// NEXT CHANNEL
-// ======================================================
-
-function nextChannel() {
-
-  if (channels.length === 0) {
-    return false;
-  }
-
-  let next =
-    currentIndex + 1;
-
-  if (next >= channels.length) {
-    next = 0;
-  }
-
-  return startChannel(next);
-}
-
-
-// ======================================================
-// EXPRESS
-// ======================================================
-
-// ------------------------------------------------------
-// HOME
-// ------------------------------------------------------
+// =====================================================
+// API CHANNELS
+// =====================================================
 
 app.get(
-  "/",
+  "/api/channels",
   (req, res) => {
 
-    res.send(`<!DOCTYPE html>
-<html lang="vi">
+    res.json({
 
-<head>
+      count:
+        channels.length,
 
-<meta charset="UTF-8">
+      current:
+        currentChannel
+          ? currentChannel.id
+          : null,
 
-<meta
-  name="viewport"
-  content="width=device-width, initial-scale=1.0"
->
+      channels:
+        channels.map(
+          ch => ({
 
-<title>IPTV Server</title>
+            id:
+              ch.id,
 
-<style>
+            name:
+              ch.name,
 
-body {
-  background:#111;
-  color:#fff;
-  font-family:Arial,sans-serif;
-  margin:0;
-  padding:20px;
-}
+            group:
+              ch.group,
 
-video,
-img {
-  width:320px;
-  height:240px;
-  background:#000;
-  object-fit:contain;
-  display:block;
-  margin-bottom:15px;
-}
-
-button {
-  padding:10px 16px;
-  margin:4px;
-  font-size:16px;
-}
-
-select {
-  padding:10px;
-  width:320px;
-  max-width:100%;
-}
-
-pre {
-  white-space:pre-wrap;
-  background:#222;
-  padding:10px;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<h2>IPTV Server</h2>
-
-<select id="channels"></select>
-
-<br><br>
-
-<button onclick="playSelected()">
-Phát kênh
-</button>
-
-<button onclick="nextChannel()">
-Kênh tiếp
-</button>
-
-<h3>HLS</h3>
-
-<video
-  id="video"
-  controls
-  autoplay
-  playsinline
-></video>
-
-<h3>MJPEG ESP32</h3>
-
-<img
-  id="mjpeg"
-  src="/stream"
-/>
-
-<h3>Stats</h3>
-
-<pre id="stats">
-Loading...
-</pre>
-
-<script>
-
-const select =
-  document.getElementById("channels");
-
-const video =
-  document.getElementById("video");
-
-async function loadChannels() {
-
-  const response =
-    await fetch("/api/channels");
-
-  const data =
-    await response.json();
-
-  select.innerHTML = "";
-
-  for (const ch of data.channels) {
-
-    const option =
-      document.createElement("option");
-
-    option.value =
-      ch.index;
-
-    option.textContent =
-      ch.index +
-      " - " +
-      ch.name;
-
-    select.appendChild(option);
-  }
-}
-
-
-function playSelected() {
-
-  const index =
-    Number(select.value);
-
-  fetch(
-    "/api/channel/" + index
-  )
-  .then(() => {
-
-    setTimeout(() => {
-
-      video.src =
-        "/hls/index.m3u8?t=" +
-        Date.now();
-
-      video.play()
-        .catch(() => {});
-
-    }, 1500);
-
-  });
-}
-
-
-function nextChannel() {
-
-  fetch("/api/next")
-    .then(() => {
-
-      setTimeout(() => {
-
-        video.src =
-          "/hls/index.m3u8?t=" +
-          Date.now();
-
-        video.play()
-          .catch(() => {});
-
-        loadChannels();
-
-      }, 1500);
-
+            logo:
+              ch.logo
+          })
+        )
     });
-}
+  }
+);
 
+// =====================================================
+// SELECT
+// =====================================================
 
-async function updateStats() {
+app.get(
+  "/api/select/:id",
+  (req, res) => {
 
-  try {
-
-    const response =
-      await fetch("/api/current");
-
-    const data =
-      await response.json();
-
-    document.getElementById(
-      "stats"
-    ).textContent =
-      JSON.stringify(
-        data,
-        null,
-        2
+    const channel =
+      channels.find(
+        ch =>
+          ch.id ===
+          String(
+            req.params.id
+          )
       );
 
-  } catch (_) {}
+    if (!channel) {
 
-}
+      return res
+        .status(404)
+        .json({
+          error:
+            "Không tìm thấy kênh"
+        });
+    }
 
+    currentChannel =
+      channel;
 
-loadChannels();
+    startFFmpeg(
+      channel
+    );
 
-setInterval(
-  updateStats,
-  1000
-);
+    res.json({
 
-</script>
+      ok: true,
 
-</body>
-</html>`);
+      id:
+        channel.id,
+
+      name:
+        channel.name
+    });
   }
 );
 
+// =====================================================
+// HLS PLAYLIST
+// =====================================================
 
-// ======================================================
-// MJPEG STREAM
-// ======================================================
+app.get(
+  "/hls/stream.m3u8",
+  (req, res) => {
+
+    const playlist =
+      path.join(
+        HLS_DIR,
+        "stream.m3u8"
+      );
+
+    if (
+      !fs.existsSync(
+        playlist
+      )
+    ) {
+
+      return res
+        .status(404)
+        .send(
+          "HLS chưa sẵn sàng"
+        );
+    }
+
+    try {
+
+      let data =
+        fs.readFileSync(
+          playlist,
+          "utf8"
+        );
+
+      data =
+        data.replace(
+          /^([^#\r\n]+\.ts)$/gm,
+          "/hls-segment/$1"
+        );
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.apple.mpegurl"
+      );
+
+      res.setHeader(
+        "Cache-Control",
+        "no-cache, no-store, must-revalidate"
+      );
+
+      res.send(data);
+
+    } catch {
+
+      res
+        .status(500)
+        .send(
+          "HLS error"
+        );
+    }
+  }
+);
+
+// =====================================================
+// HLS SEGMENTS
+// =====================================================
+
+app.get(
+  "/hls-segment/:file",
+  (req, res) => {
+
+    const file =
+      path.basename(
+        req.params.file
+      );
+
+    const filePath =
+      path.join(
+        HLS_DIR,
+        file
+      );
+
+    if (
+      !fs.existsSync(
+        filePath
+      )
+    ) {
+
+      return res
+        .status(404)
+        .end();
+    }
+
+    res.setHeader(
+      "Content-Type",
+      "video/mp2t"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-cache"
+    );
+
+    fs
+      .createReadStream(
+        filePath
+      )
+      .pipe(res);
+  }
+);
+
+// =====================================================
+// MJPEG
+// =====================================================
 
 app.get(
   "/stream",
   (req, res) => {
 
+    const requestedUrl =
+      req.query.url ||
+      req.query.channelUrl;
+
+    if (requestedUrl) {
+
+      const customChannel = {
+        id: "custom",
+        name: "Custom stream",
+        group: "custom",
+        url: requestedUrl,
+        checking: false,
+        available: true,
+        error: null
+      };
+
+      currentChannel =
+        customChannel;
+
+      startFFmpeg(
+        customChannel
+      );
+    }
+
+    res.statusCode = 200;
+
+    // QUAN TRỌNG:
+    // /stream chỉ trả MJPEG.
+    // Không trộn PCM audio vào đây.
     res.setHeader(
       "Content-Type",
       "multipart/x-mixed-replace; boundary=frame"
@@ -1347,427 +1118,695 @@ app.get(
       "keep-alive"
     );
 
-    res.flushHeaders();
+    if (
+      typeof res.flushHeaders ===
+      "function"
+    ) {
 
-    const client = {
-      res
-    };
+      res.flushHeaders();
+    }
 
-    mjpegClients.add(client);
+    let closed = false;
+
+    let lastSentTime = 0;
+
+    const timer =
+      setInterval(
+        () => {
+
+          if (closed) {
+
+            clearInterval(timer);
+
+            return;
+          }
+
+          // ======================================
+          // CHỈ MJPEG
+          // ======================================
+
+          if (
+            frames.length === 0
+          ) {
+            return;
+          }
+
+          const target =
+            Date.now() -
+            DELAY_SECONDS * 1000;
+
+          let selected = null;
+
+          for (
+            let i =
+              frames.length - 1;
+            i >= 0;
+            i--
+          ) {
+
+            if (
+              frames[i].time <=
+              target
+            ) {
+
+              selected =
+                frames[i];
+
+              break;
+            }
+          }
+
+          if (!selected) {
+
+            selected =
+              frames[
+                frames.length - 1
+              ];
+          }
+
+          if (
+            selected.time ===
+            lastSentTime
+          ) {
+            return;
+          }
+
+          lastSentTime =
+            selected.time;
+
+          try {
+
+            res.write(
+              "--frame\r\n"
+            );
+
+            res.write(
+              "Content-Type: image/jpeg\r\n"
+            );
+
+            res.write(
+              "Content-Length: " +
+              selected.data.length +
+              "\r\n\r\n"
+            );
+
+            res.write(
+              selected.data
+            );
+
+            res.write(
+              "\r\n"
+            );
+
+          } catch {
+
+            closed = true;
+
+            clearInterval(timer);
+          }
+
+        },
+        1000 / FPS
+      );
 
     req.on(
       "close",
       () => {
-        mjpegClients.delete(client);
+
+        closed = true;
+
+        clearInterval(timer);
       }
     );
   }
 );
 
-
-// ======================================================
-// HLS PLAYLIST
-// ======================================================
-
-app.get(
-  "/hls/index.m3u8",
-  (req, res) => {
-
-    if (!currentChannel) {
-      return res
-        .status(404)
-        .send("No channel");
-    }
-
-    const dir =
-      path.join(
-        TMP_ROOT,
-        `hls-${sessionId}`
-      );
-
-    const playlist =
-      path.join(
-        dir,
-        "index.m3u8"
-      );
-
-    if (!fs.existsSync(playlist)) {
-      return res
-        .status(404)
-        .send("HLS not ready");
-    }
-
-    try {
-
-      let data =
-        fs.readFileSync(
-          playlist,
-          "utf8"
-        );
-
-      // --------------------------------------
-      // Rewrite TS segment URL
-      // --------------------------------------
-
-      data =
-        data.replace(
-          /^([^#\r\n]+\.ts)$/gm,
-          "/hls-segment/$1"
-        );
-
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.apple.mpegurl"
-      );
-
-      res.setHeader(
-        "Cache-Control",
-        "no-cache, no-store, must-revalidate"
-      );
-
-      res.send(data);
-
-    } catch (err) {
-
-      res
-        .status(500)
-        .send(err.message);
-    }
-  }
-);
-
-
-// ======================================================
-// HLS SEGMENT
-// ======================================================
-
-app.get(
-  "/hls-segment/:file",
-  (req, res) => {
-
-    const dir =
-      path.join(
-        TMP_ROOT,
-        `hls-${sessionId}`
-      );
-
-    const file =
-      path.basename(
-        req.params.file
-      );
-
-    const fullPath =
-      path.join(
-        dir,
-        file
-      );
-
-    if (!fs.existsSync(fullPath)) {
-      return res
-        .status(404)
-        .send("Segment not found");
-    }
-
-    res.setHeader(
-      "Content-Type",
-      "video/mp2t"
-    );
-
-    res.setHeader(
-      "Cache-Control",
-      "no-cache"
-    );
-
-    res.sendFile(
-      fullPath
-    );
-  }
-);
-
-
-// ======================================================
-// CHANNEL API
-// ======================================================
-
-app.get(
-  "/api/channels",
-  (req, res) => {
-
-    res.json({
-      count: channels.length,
-
-      checking: false,
-
-      channels:
-        channels.map(ch => ({
-          index: ch.index,
-
-          name: ch.name,
-
-          tvgId: ch.tvgId,
-
-          group: ch.group,
-
-          logo: ch.logo,
-
-          url: ch.url,
-
-          live: ch.live,
-
-          error: ch.error,
-
-          status:
-            ch.index === currentIndex
-              ? "current"
-              : "unchecked"
-        }))
-    });
-  }
-);
-
-
-// ======================================================
-// CURRENT
-// ======================================================
-
-app.get(
-  "/api/current",
-  (req, res) => {
-
-    res.json({
-      ok: true,
-
-      index: currentIndex,
-
-      channel: currentChannel
-        ? {
-            index:
-              currentChannel.index,
-
-            name:
-              currentChannel.name,
-
-            url:
-              currentChannel.url
-          }
-        : null,
-
-      session:
-        sessionId,
-
-      resolution:
-        `${WIDTH}x${HEIGHT}`,
-
-      targetFPS:
-        FPS,
-
-      stats
-    });
-  }
-);
-
-
-// ======================================================
-// SELECT CHANNEL
-// ======================================================
-
-app.get(
-  "/api/channel/:index",
-  (req, res) => {
-
-    const index =
-      Number(req.params.index);
-
-    if (
-      !Number.isInteger(index) ||
-      index < 0 ||
-      index >= channels.length
-    ) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "Invalid channel"
-        });
-    }
-
-    startChannel(index);
-
-    res.json({
-      ok: true,
-
-      index,
-
-      channel:
-        channels[index].name,
-
-      message:
-        "Channel started"
-    });
-  }
-);
-
-
-// ======================================================
-// NEXT
-// ======================================================
-
-app.get(
-  "/api/next",
-  (req, res) => {
-
-    const ok =
-      nextChannel();
-
-    if (!ok) {
-      return res
-        .status(500)
-        .json({
-          ok: false
-        });
-    }
-
-    res.json({
-      ok: true,
-
-      index:
-        currentIndex,
-
-      channel:
-        currentChannel
-          ? currentChannel.name
-          : null
-    });
-  }
-);
-
-
-// ======================================================
+// =====================================================
 // HEALTH
-// ======================================================
+// =====================================================
 
 app.get(
   "/health",
   (req, res) => {
 
     res.json({
-      ok: true,
 
-      channels:
+      status: "ok",
+
+      playlist:
+        M3U_URL,
+
+      channelCount:
         channels.length,
-
-      currentIndex,
 
       currentChannel:
         currentChannel
-          ? currentChannel.name
+          ? {
+              id:
+                currentChannel.id,
+
+              name:
+                currentChannel.name
+            }
           : null,
 
-      session:
-        sessionId,
+      mjpeg: {
 
-      mjpegClients:
-        mjpegClients.size,
+        url:
+          "/stream",
 
-      frameBuffer:
-        frameBuffer.length,
+        width:
+          WIDTH,
 
-      audioBuffer:
-        audioQueue.length
+        height:
+          HEIGHT,
+
+        fps:
+          FPS,
+
+        delaySeconds:
+          DELAY_SECONDS,
+
+        bufferSeconds:
+          BUFFER_SECONDS,
+
+        currentFrames:
+          frames.length
+      }
     });
   }
 );
 
+// =====================================================
+// WEB
+// =====================================================
 
-// ======================================================
-// START SERVER
-// ======================================================
+app.get(
+  "/",
+  (req, res) => {
 
-async function main() {
+    const host =
+      req.get("host");
+
+    const protocol =
+      req.headers[
+        "x-forwarded-proto"
+      ] ||
+      req.protocol;
+
+    const hlsUrl =
+      `${protocol}://${host}/hls/stream.m3u8`;
+
+    res.send(`
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+name="viewport"
+content="width=device-width,initial-scale=1"
+>
+
+<title>Vietnam TV</title>
+
+<style>
+
+body {
+  margin:0;
+  padding:15px;
+  background:#111;
+  color:white;
+  font-family:Arial;
+}
+
+.container {
+  max-width:900px;
+  margin:auto;
+}
+
+video {
+  width:100%;
+  background:#000;
+}
+
+.search {
+  width:100%;
+  box-sizing:border-box;
+  padding:12px;
+  margin:15px 0;
+  background:#222;
+  border:1px solid #444;
+  color:#fff;
+  border-radius:6px;
+}
+
+.channel {
+  padding:12px;
+  margin:5px 0;
+  background:#222;
+  border-radius:6px;
+  cursor:pointer;
+}
+
+.channel:hover {
+  background:#333;
+}
+
+.channel.active {
+  background:#075e9b;
+}
+
+.info {
+  color:#aaa;
+  font-size:14px;
+  margin:8px 0;
+}
+
+.mjpeg {
+  width:320px;
+  height:240px;
+  background:#000;
+  object-fit:contain;
+}
+
+#status {
+  margin:10px 0;
+  color:#4caf50;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h2>🇻🇳 Vietnam TV</h2>
+
+<div id="status">
+Đang tải danh sách...
+</div>
+
+<video
+id="video"
+controls
+autoplay
+playsinline
+></video>
+
+<h3>Danh sách kênh</h3>
+
+<input
+id="search"
+class="search"
+placeholder="🔎 Tìm VTV, HTV, SCTV..."
+>
+
+<div id="channels"></div>
+
+<h3>ESP32 MJPEG</h3>
+
+<div class="info">
+320 × 240 — 14 FPS — delay khoảng 1 giây
+</div>
+
+<img
+src="/stream"
+class="mjpeg"
+width="320"
+height="240"
+>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+
+<script>
+
+const video =
+document.getElementById(
+  "video"
+);
+
+const channelBox =
+document.getElementById(
+  "channels"
+);
+
+const search =
+document.getElementById(
+  "search"
+);
+
+const status =
+document.getElementById(
+  "status"
+);
+
+const hlsUrl =
+"${hlsUrl}";
+
+let channels = [];
+
+let current = null;
+
+let hls = null;
+
+
+// =========================================
+// LOAD
+// =========================================
+
+async function loadChannels() {
 
   try {
 
-    await loadPlaylist();
-
-    app.listen(
-      PORT,
-      "0.0.0.0",
-      () => {
-
-        console.log("");
-        console.log("==========================================");
-        console.log("IPTV SERVER STARTED");
-        console.log("PORT:", PORT);
-        console.log("CHANNELS:", channels.length);
-        console.log("==========================================");
-        console.log("");
-      }
-    );
-
-    // ----------------------------------------
-    // KHÔNG CHECK CHANNELS
-    // Phát thẳng kênh đầu tiên
-    // ----------------------------------------
-
-    if (channels.length > 0) {
-
-      startChannel(0);
-
-    } else {
-
-      console.log(
-        "No channels found."
+    const r =
+      await fetch(
+        "/api/channels"
       );
-    }
 
-  } catch (err) {
+    const data =
+      await r.json();
 
-    console.error(
-      "SERVER START ERROR:",
-      err
-    );
+    channels =
+      data.channels;
 
-    process.exit(1);
+    current =
+      data.current;
+
+    renderChannels();
+
+    const ch =
+      channels.find(
+        c => c.id === current
+      );
+
+    status.innerText =
+      "Đang phát: " +
+      (
+        ch
+          ? ch.name
+          : ""
+      );
+
+    startHLS();
+
+  } catch {
+
+    status.innerText =
+      "Không tải được danh sách";
   }
 }
 
 
-// ======================================================
-// PROCESS SIGNALS
-// ======================================================
+// =========================================
+// HLS
+// =========================================
 
-process.on(
-  "SIGTERM",
-  () => {
+function startHLS() {
 
-    console.log(
-      "SIGTERM received"
+  if (
+    video.canPlayType(
+      "application/vnd.apple.mpegurl"
+    )
+  ) {
+
+    video.src =
+      hlsUrl;
+
+    video.play()
+      .catch(() => {});
+
+    return;
+  }
+
+  if (
+    typeof Hls !== "undefined" &&
+    Hls.isSupported()
+  ) {
+
+    if (hls) {
+      hls.destroy();
+    }
+
+    hls =
+      new Hls({
+        lowLatencyMode:false,
+        liveSyncDurationCount:4,
+        liveMaxLatencyDurationCount:8
+      });
+
+    hls.loadSource(
+      hlsUrl
     );
 
-    stopCurrentSession();
+    hls.attachMedia(
+      video
+    );
 
-    process.exit(0);
+    hls.on(
+      Hls.Events.MANIFEST_PARSED,
+      () => {
+
+        video.play()
+          .catch(() => {});
+      }
+    );
   }
+}
+
+
+// =========================================
+// RENDER
+// =========================================
+
+function renderChannels() {
+
+  const keyword =
+    search.value
+      .toLowerCase()
+      .trim();
+
+  channelBox.innerHTML = "";
+
+  channels
+    .filter(
+      ch =>
+        ch.name
+          .toLowerCase()
+          .includes(keyword)
+    )
+    .forEach(
+      ch => {
+
+        const div =
+          document.createElement(
+            "div"
+          );
+
+        div.className =
+          "channel" +
+          (
+            ch.id === current
+              ? " active"
+              : ""
+          );
+
+        div.innerText =
+          ch.name;
+
+        div.onclick =
+          () =>
+            selectChannel(
+              ch.id,
+              ch.name
+            );
+
+        channelBox.appendChild(
+          div
+        );
+      }
+    );
+}
+
+
+// =========================================
+// SELECT
+// =========================================
+
+async function selectChannel(
+  id,
+  name
+) {
+
+  status.innerText =
+    "Đang chuyển sang " +
+    name +
+    "...";
+
+  try {
+
+    const r =
+      await fetch(
+        "/api/select/" +
+        id
+      );
+
+    const data =
+      await r.json();
+
+    if (!data.ok) {
+      throw new Error();
+    }
+
+    current =
+      id;
+
+    renderChannels();
+
+    status.innerText =
+      "Đang phát: " +
+      name;
+
+    setTimeout(
+      startHLS,
+      1500
+    );
+
+  } catch {
+
+    status.innerText =
+      "Kênh này không thể phát";
+  }
+}
+
+
+// =========================================
+// SEARCH
+// =========================================
+
+search.addEventListener(
+  "input",
+  renderChannels
 );
 
 
-process.on(
-  "SIGINT",
-  () => {
+// =========================================
+// START
+// =========================================
 
-    console.log(
-      "SIGINT received"
-    );
+loadChannels();
 
-    stopCurrentSession();
+</script>
 
-    process.exit(0);
+</body>
+
+</html>
+
+`);
   }
 );
 
+// =====================================================
+// START
+// =====================================================
 
-// ======================================================
-// RUN
-// ======================================================
+app.listen(
+  PORT,
+  "0.0.0.0",
+  async () => {
 
-main();
+    console.log("");
+    console.log(
+      "======================================"
+    );
+
+    console.log(
+      "VIETNAM TV SERVER"
+    );
+
+    console.log(
+      "======================================"
+    );
+
+    try {
+
+      console.log(
+        "Đang tải vn.m3u..."
+      );
+
+      const m3u =
+        await downloadM3U(
+          M3U_URL
+        );
+
+      // =========================================
+      // KHÔNG CHECK STREAM
+      // GIỮ TOÀN BỘ KÊNH
+      // =========================================
+
+      channels =
+        parseM3U(m3u);
+
+      console.log(
+        "Tìm thấy:",
+        channels.length,
+        "kênh"
+      );
+
+      if (
+        channels.length === 0
+      ) {
+
+        console.error(
+          "Không tìm thấy kênh!"
+        );
+
+        process.exit(1);
+      }
+
+      // =========================================
+      // KÊNH ĐẦU TIÊN
+      // =========================================
+
+      currentChannel =
+        channels[0];
+
+      startFFmpeg(
+        currentChannel
+      );
+
+      console.log("");
+
+      console.log(
+        "Server:",
+        `http://0.0.0.0:${PORT}`
+      );
+
+      console.log(
+        "Tổng số kênh:",
+        channels.length
+      );
+
+      console.log(
+        "KHÔNG CHECK STREAM"
+      );
+
+    } catch (error) {
+
+      console.error(
+        "LỖI:",
+        error.message
+      );
+
+      process.exit(1);
+    }
+  }
+);

@@ -8,7 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 const M3U_URL =
-    "https://raw.githubusercontent.com/anhkhanhdeptrai/Tv/main/Vn.m3u";
+    "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/vn.m3u";
 
 // =====================================================
 // VIDEO CONFIG

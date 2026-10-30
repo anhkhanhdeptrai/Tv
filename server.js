@@ -27,7 +27,7 @@ const JPEG_QUALITY = 8;
 // AUDIO
 // =====================================================
 
-const AUDIO_SAMPLE_RATE = 16000;
+const AUDIO_SAMPLE_RATE = 41000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 

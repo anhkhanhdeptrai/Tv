@@ -1,3 +1,4 @@
+
 const express = require("express");
 const { spawn } = require("child_process");
 const https = require("https");
@@ -6,10 +7,11 @@ const http = require("http");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-const M3U_URL = "https://raw.githubusercontent.com/anhkhanhdeptrai/Tv/main/Vn.m3u";
+const M3U_URL =
+    "https://raw.githubusercontent.com/anhkhanhdeptrai/Tv/main/Vn.m3u";
 
 // =====================================================
-// VIDEO CONFIG - GIỮ NGUYÊN
+// VIDEO CONFIG
 // =====================================================
 
 const WIDTH = 320;
@@ -18,10 +20,12 @@ const FPS = 8;
 const JPEG_QUALITY = 10;
 
 const MAX_JPEG_BUFFER = 1024 * 1024;
+
 const FRAME_TIMEOUT = 15000;
+const FRAME_TIMEOUT_720P = 75000;
 
 // =====================================================
-// AUDIO CONFIG - GIỮ NGUYÊN
+// AUDIO CONFIG
 // =====================================================
 
 const AUDIO_SAMPLE_RATE = 16000;
@@ -32,16 +36,16 @@ const AUDIO_BYTES_PER_SAMPLE = 2;
 const AUDIO_CHUNK_MS = 20;
 
 const AUDIO_CHUNK_SIZE =
-AUDIO_SAMPLE_RATE *
-AUDIO_CHANNELS *
-AUDIO_BYTES_PER_SAMPLE *
-AUDIO_CHUNK_MS / 1000;
+    AUDIO_SAMPLE_RATE *
+    AUDIO_CHANNELS *
+    AUDIO_BYTES_PER_SAMPLE *
+    AUDIO_CHUNK_MS / 1000;
 
 const AUDIO_BUFFER_MAX =
-AUDIO_SAMPLE_RATE *
-AUDIO_CHANNELS *
-AUDIO_BYTES_PER_SAMPLE *
-0.15;
+    AUDIO_SAMPLE_RATE *
+    AUDIO_CHANNELS *
+    AUDIO_BYTES_PER_SAMPLE *
+    0.15;
 
 // =====================================================
 // NETWORK
@@ -49,6 +53,11 @@ AUDIO_BYTES_PER_SAMPLE *
 
 const M3U_TIMEOUT = 15000;
 const FFMPEG_RESTART_DELAY = 3000;
+
+const NETWORK_TIMEOUT_NORMAL = 15000000;
+const NETWORK_TIMEOUT_720P = 60000000;
+
+const RESTART_DELAY_720P = 5000;
 
 // =====================================================
 // STATE
@@ -88,11 +97,9 @@ let lastFpsLog = Date.now();
 
 // =====================================================
 // DETECT 720P
-// Chỉ áp dụng xử lý riêng cho tên kênh có 720p
 // =====================================================
 
 function is720pChannel(channel) {
-
     const info = [
         channel.name || "",
         channel.tvgName || "",
@@ -108,9 +115,7 @@ function is720pChannel(channel) {
 // =====================================================
 
 function downloadM3U(url) {
-
     return new Promise((resolve, reject) => {
-
         const protocol = url.startsWith("https:")
             ? https
             : http;
@@ -124,7 +129,6 @@ function downloadM3U(url) {
                 }
             },
             response => {
-
                 if (
                     response.statusCode < 200 ||
                     response.statusCode >= 300
@@ -145,23 +149,18 @@ function downloadM3U(url) {
                 response.setEncoding("utf8");
 
                 response.on("data", chunk => {
-
                     data += chunk;
 
                     if (data.length > 20 * 1024 * 1024) {
-
                         request.destroy(
                             new Error("M3U quá lớn")
                         );
-
                     }
-
                 });
 
                 response.on("end", () => {
                     resolve(data);
                 });
-
             }
         );
 
@@ -172,9 +171,7 @@ function downloadM3U(url) {
         });
 
         request.on("error", reject);
-
     });
-
 }
 
 // =====================================================
@@ -182,7 +179,6 @@ function downloadM3U(url) {
 // =====================================================
 
 function parseM3U(text) {
-
     const lines = text
         .split(/\r?\n/)
         .map(x => x.trim())
@@ -191,7 +187,6 @@ function parseM3U(text) {
     const result = [];
 
     for (let i = 0; i < lines.length; i++) {
-
         const line = lines[i];
 
         if (!line.startsWith("#EXTINF")) {
@@ -217,12 +212,10 @@ function parseM3U(text) {
         let url = "";
 
         for (let j = i + 1; j < lines.length; j++) {
-
             if (!lines[j].startsWith("#")) {
                 url = lines[j];
                 break;
             }
-
         }
 
         if (!url) continue;
@@ -254,7 +247,6 @@ function parseM3U(text) {
             group,
             url
         });
-
     }
 
     return result;
@@ -265,14 +257,12 @@ function parseM3U(text) {
 // =====================================================
 
 function clearVideoBuffer() {
-
     latestFrame = null;
     jpegBuffer = Buffer.alloc(0);
     lastVideoFrameTime = 0;
 
     frameCount = 0;
     lastFpsLog = Date.now();
-
 }
 
 function clearAudioBuffer() {
@@ -289,12 +279,10 @@ function clearAllBuffers() {
 // =====================================================
 
 function stopWatchdog() {
-
     if (watchdogTimer) {
         clearInterval(watchdogTimer);
         watchdogTimer = null;
     }
-
 }
 
 // =====================================================
@@ -302,7 +290,6 @@ function stopWatchdog() {
 // =====================================================
 
 function stopFFmpeg(clearChannel = true) {
-
     ffmpegGeneration++;
 
     if (restartTimer) {
@@ -313,7 +300,6 @@ function stopFFmpeg(clearChannel = true) {
     stopWatchdog();
 
     const oldFFmpeg = ffmpeg;
-
     ffmpeg = null;
 
     if (clearChannel) {
@@ -321,22 +307,17 @@ function stopFFmpeg(clearChannel = true) {
     }
 
     if (oldFFmpeg) {
-
         try {
             oldFFmpeg.kill("SIGKILL");
         } catch (error) {
-
             console.log(
                 "Không thể dừng FFmpeg:",
                 error.message
             );
-
         }
-
     }
 
     clearAllBuffers();
-
 }
 
 // =====================================================
@@ -344,7 +325,6 @@ function stopFFmpeg(clearChannel = true) {
 // =====================================================
 
 function scheduleRestart(channel, generation) {
-
     if (
         generation !== ffmpegGeneration ||
         !currentChannel ||
@@ -355,12 +335,15 @@ function scheduleRestart(channel, generation) {
 
     if (restartTimer) return;
 
+    const retryDelay = is720pChannel(channel)
+        ? RESTART_DELAY_720P
+        : FFMPEG_RESTART_DELAY;
+
     console.log(
-        `FFmpeg thử kết nối lại sau ${FFMPEG_RESTART_DELAY / 1000}s`
+        `FFmpeg thử kết nối lại sau ${retryDelay / 1000}s`
     );
 
     restartTimer = setTimeout(() => {
-
         restartTimer = null;
 
         if (
@@ -375,9 +358,7 @@ function scheduleRestart(channel, generation) {
         console.log("ĐANG KẾT NỐI LẠI IPTV...");
 
         launchFFmpeg(channel);
-
-    }, FFMPEG_RESTART_DELAY);
-
+    }, retryDelay);
 }
 
 // =====================================================
@@ -385,11 +366,13 @@ function scheduleRestart(channel, generation) {
 // =====================================================
 
 function startWatchdog(channel, generation) {
-
     stopWatchdog();
 
-    watchdogTimer = setInterval(() => {
+    const timeout = is720pChannel(channel)
+        ? FRAME_TIMEOUT_720P
+        : FRAME_TIMEOUT;
 
+    watchdogTimer = setInterval(() => {
         if (
             generation !== ffmpegGeneration ||
             !ffmpeg ||
@@ -403,20 +386,21 @@ function startWatchdog(channel, generation) {
         const elapsed =
             Date.now() - lastVideoFrameTime;
 
-        if (elapsed > FRAME_TIMEOUT) {
-
+        if (elapsed > timeout) {
             console.log(
                 "VIDEO TIMEOUT:",
                 elapsed,
-                "ms"
+                "ms",
+                "| CHANNEL:",
+                channel.name,
+                "| LIMIT:",
+                timeout
             );
 
             const old = ffmpeg;
-
             ffmpeg = null;
 
             stopWatchdog();
-
             clearAllBuffers();
 
             try {
@@ -424,11 +408,8 @@ function startWatchdog(channel, generation) {
             } catch {}
 
             scheduleRestart(channel, generation);
-
         }
-
     }, 5000);
-
 }
 
 // =====================================================
@@ -436,15 +417,16 @@ function startWatchdog(channel, generation) {
 // =====================================================
 
 function launchFFmpeg(channel) {
-
     if (!channel || !channel.url) {
         return false;
     }
 
     const generation = ffmpegGeneration;
-
-    // Phân loại nguồn
     const special720p = is720pChannel(channel);
+
+    const networkTimeout = special720p
+        ? NETWORK_TIMEOUT_720P
+        : NETWORK_TIMEOUT_NORMAL;
 
     console.log("");
     console.log("======================================");
@@ -452,10 +434,17 @@ function launchFFmpeg(channel) {
     console.log("URL:", channel.url);
     console.log("GENERATION:", generation);
     console.log("720P MODE:", special720p ? "ON" : "OFF");
+    console.log(
+        "WATCHDOG:",
+        special720p
+            ? FRAME_TIMEOUT_720P
+            : FRAME_TIMEOUT,
+        "ms"
+    );
+    console.log("NETWORK TIMEOUT:", networkTimeout);
     console.log("======================================");
 
     const args = [
-
         "-hide_banner",
         "-loglevel", "warning",
 
@@ -463,34 +452,53 @@ function launchFFmpeg(channel) {
         "-thread_queue_size", "512",
         "-threads", "2",
 
-        // NETWORK RECONNECT
+        // =============================================
+        // HTTP NETWORK RECONNECT
+        // =============================================
+
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_at_eof", "1",
-        "-reconnect_delay_max", "5",
-        "-rw_timeout", "15000000",
+
+        "-reconnect_on_network_error", "1",
+        "-reconnect_on_http_error", "5xx,408,429",
+
+        "-reconnect_max_retries", "10",
+        "-reconnect_delay_max", "10",
+
+        "-rw_timeout",
+        String(networkTimeout),
+
         "-user_agent", "Mozilla/5.0",
 
-        // TIMESTAMP
+        // =============================================
+        // TIMESTAMP / CORRUPT PACKET
+        // =============================================
+
         "-fflags", "+genpts+discardcorrupt",
         "-err_detect", "ignore_err",
 
         // =============================================
-        // CHỈ RIÊNG KÊNH 720P
+        // HLS RETRY - CHỈ RIÊNG 720P
+        // Đặt trước -i vì đây là input options
         // =============================================
 
         ...(special720p
             ? [
-                "-readrate", "1"
+                "-max_reload", "1000",
+                "-m3u8_hold_counters", "1000",
+                "-seg_max_retry", "5"
             ]
             : []),
 
+        // =============================================
         // INPUT
+        // =============================================
+
         "-i", channel.url,
 
         // =============================================
         // OUTPUT 1: VIDEO MJPEG
-        // Giữ nguyên thông số đầu ra
         // =============================================
 
         "-map", "0:v:0",
@@ -527,13 +535,11 @@ function launchFFmpeg(channel) {
 
         "-f", "s16le",
         "pipe:3"
-
     ];
 
     let processFFmpeg;
 
     try {
-
         processFFmpeg = spawn(
             "ffmpeg",
             args,
@@ -546,20 +552,17 @@ function launchFFmpeg(channel) {
                 ]
             }
         );
-
     } catch (error) {
-
         console.log(
             "FFMPEG SPAWN ERROR:",
             error.message
         );
 
+        scheduleRestart(channel, generation);
         return false;
-
     }
 
     ffmpeg = processFFmpeg;
-
     lastVideoFrameTime = Date.now();
 
     startWatchdog(channel, generation);
@@ -569,7 +572,6 @@ function launchFFmpeg(channel) {
     // =============================================
 
     processFFmpeg.stderr.on("data", data => {
-
         if (
             generation !== ffmpegGeneration ||
             processFFmpeg !== ffmpeg
@@ -582,7 +584,6 @@ function launchFFmpeg(channel) {
         if (message) {
             console.log("[FFmpeg]", message);
         }
-
     });
 
     // =============================================
@@ -590,7 +591,6 @@ function launchFFmpeg(channel) {
     // =============================================
 
     processFFmpeg.stdout.on("data", chunk => {
-
         if (
             generation !== ffmpegGeneration ||
             processFFmpeg !== ffmpeg
@@ -604,11 +604,9 @@ function launchFFmpeg(channel) {
         ]);
 
         while (jpegBuffer.length >= 4) {
-
             const start = jpegBuffer.indexOf(JPEG_START);
 
             if (start === -1) {
-
                 const last =
                     jpegBuffer[jpegBuffer.length - 1];
 
@@ -629,9 +627,7 @@ function launchFFmpeg(channel) {
             );
 
             if (end === -1) {
-
                 if (jpegBuffer.length > MAX_JPEG_BUFFER) {
-
                     const next = jpegBuffer.indexOf(
                         JPEG_START,
                         2
@@ -642,7 +638,6 @@ function launchFFmpeg(channel) {
                     } else {
                         jpegBuffer = Buffer.alloc(0);
                     }
-
                 }
 
                 break;
@@ -667,7 +662,6 @@ function launchFFmpeg(channel) {
                 continue;
             }
 
-            // FRAME MỚI NHẤT
             const now = Date.now();
 
             latestFrame = {
@@ -678,14 +672,10 @@ function launchFFmpeg(channel) {
 
             lastVideoFrameTime = now;
 
-            // =====================================
             // FPS MONITOR
-            // =====================================
-
             frameCount++;
 
             if (now - lastFpsLog >= 5000) {
-
                 const realFPS =
                     frameCount /
                     ((now - lastFpsLog) / 1000);
@@ -702,24 +692,17 @@ function launchFFmpeg(channel) {
 
                 frameCount = 0;
                 lastFpsLog = now;
-
             }
-
         }
-
     });
 
     processFFmpeg.stdout.on("error", error => {
-
         if (generation === ffmpegGeneration) {
-
             console.log(
                 "[VIDEO PIPE ERROR]",
                 error.message
             );
-
         }
-
     });
 
     // =============================================
@@ -727,7 +710,6 @@ function launchFFmpeg(channel) {
     // =============================================
 
     processFFmpeg.stdio[3].on("data", chunk => {
-
         if (
             generation !== ffmpegGeneration ||
             processFFmpeg !== ffmpeg
@@ -740,28 +722,20 @@ function launchFFmpeg(channel) {
             chunk
         ]);
 
-        // GIỮ TỐI ĐA 150MS
         if (audioBuffer.length > AUDIO_BUFFER_MAX) {
-
             audioBuffer = audioBuffer.subarray(
                 audioBuffer.length - AUDIO_BUFFER_MAX
             );
-
         }
-
     });
 
     processFFmpeg.stdio[3].on("error", error => {
-
         if (generation === ffmpegGeneration) {
-
             console.log(
                 "[AUDIO PIPE ERROR]",
                 error.message
             );
-
         }
-
     });
 
     // =============================================
@@ -769,7 +743,6 @@ function launchFFmpeg(channel) {
     // =============================================
 
     processFFmpeg.on("error", error => {
-
         if (generation !== ffmpegGeneration) {
             return;
         }
@@ -778,7 +751,6 @@ function launchFFmpeg(channel) {
             "FFMPEG PROCESS ERROR:",
             error.message
         );
-
     });
 
     // =============================================
@@ -786,7 +758,6 @@ function launchFFmpeg(channel) {
     // =============================================
 
     processFFmpeg.on("close", (code, signal) => {
-
         if (
             generation !== ffmpegGeneration ||
             processFFmpeg !== ffmpeg
@@ -804,11 +775,9 @@ function launchFFmpeg(channel) {
         ffmpeg = null;
 
         stopWatchdog();
-
         clearAllBuffers();
 
         scheduleRestart(channel, generation);
-
     });
 
     return true;
@@ -819,7 +788,6 @@ function launchFFmpeg(channel) {
 // =====================================================
 
 function startFFmpeg(channel) {
-
     if (!channel || !channel.url) {
         return false;
     }
@@ -830,7 +798,6 @@ function startFFmpeg(channel) {
         ffmpeg &&
         ffmpeg.exitCode === null
     ) {
-
         console.log(
             "Channel already playing:",
             channel.name
@@ -851,9 +818,7 @@ function startFFmpeg(channel) {
 // =====================================================
 
 app.get("/api/channels", (req, res) => {
-
     res.json({
-
         count: channels.length,
 
         current: currentChannel
@@ -863,16 +828,12 @@ app.get("/api/channels", (req, res) => {
         playing: !!ffmpeg,
 
         channels: channels.map(channel => ({
-
             id: channel.id,
             name: channel.name,
             group: channel.group,
             logo: channel.logo
-
         }))
-
     });
-
 });
 
 // =====================================================
@@ -880,33 +841,27 @@ app.get("/api/channels", (req, res) => {
 // =====================================================
 
 app.get("/api/select/:id", (req, res) => {
-
     const channel = channels.find(
         ch => ch.id === String(req.params.id)
     );
 
     if (!channel) {
-
         return res.status(404).json({
             ok: false,
             error: "Không tìm thấy kênh"
         });
-
     }
 
     const started = startFFmpeg(channel);
 
     if (!started) {
-
         return res.status(500).json({
             ok: false,
             error: "Không thể khởi động FFmpeg"
         });
-
     }
 
     res.json({
-
         ok: true,
 
         id: channel.id,
@@ -918,23 +873,14 @@ app.get("/api/select/:id", (req, res) => {
         special720p: is720pChannel(channel),
 
         format: {
-
             video: `${WIDTH}x${HEIGHT} ${FPS}fps`,
-
             audio: "PCM S16LE",
-
             sampleRate: AUDIO_SAMPLE_RATE,
-
             channels: AUDIO_CHANNELS,
-
             bits: AUDIO_BITS,
-
             bitrate: 256000
-
         }
-
     });
-
 });
 
 // =====================================================
@@ -942,14 +888,12 @@ app.get("/api/select/:id", (req, res) => {
 // =====================================================
 
 app.get("/api/stop", (req, res) => {
-
     stopFFmpeg(true);
 
     res.json({
         ok: true,
         message: "Đã dừng phát"
     });
-
 });
 
 // =====================================================
@@ -957,7 +901,6 @@ app.get("/api/stop", (req, res) => {
 // =====================================================
 
 app.get("/stream", (req, res) => {
-
     if (!currentChannel || !ffmpeg) {
         return res.status(503).send("Chua chon kenh");
     }
@@ -992,7 +935,6 @@ app.get("/stream", (req, res) => {
     let lastFrameTime = 0;
 
     const timer = setInterval(() => {
-
         if (closed || res.destroyed) {
             cleanup();
             return;
@@ -1037,21 +979,17 @@ app.get("/stream", (req, res) => {
         ]);
 
         try {
-
             const ok = res.write(packet);
 
             if (!ok) {
                 waitingForDrain = true;
             }
-
         } catch (error) {
             cleanup();
         }
-
     }, 1000 / FPS);
 
     function cleanup() {
-
         if (closed) return;
 
         closed = true;
@@ -1061,7 +999,6 @@ app.get("/stream", (req, res) => {
         if (!res.destroyed) {
             res.end();
         }
-
     }
 
     res.on("drain", () => {
@@ -1069,17 +1006,13 @@ app.get("/stream", (req, res) => {
     });
 
     res.on("close", () => {
-
         closed = true;
-
         clearInterval(timer);
-
     });
 
     res.on("error", () => {
         cleanup();
     });
-
 });
 
 // =====================================================
@@ -1087,7 +1020,6 @@ app.get("/stream", (req, res) => {
 // =====================================================
 
 app.get("/audio", (req, res) => {
-
     if (!currentChannel || !ffmpeg) {
         return res.status(503).send("Chua chon kenh");
     }
@@ -1136,7 +1068,6 @@ app.get("/audio", (req, res) => {
     let waitingForDrain = false;
 
     const timer = setInterval(() => {
-
         if (closed || res.destroyed) {
             cleanup();
             return;
@@ -1154,7 +1085,6 @@ app.get("/audio", (req, res) => {
             return;
         }
 
-        // ĐỌC 20MS AUDIO
         const chunk = audioBuffer.subarray(
             0,
             AUDIO_CHUNK_SIZE
@@ -1165,21 +1095,17 @@ app.get("/audio", (req, res) => {
         );
 
         try {
-
             const ok = res.write(chunk);
 
             if (!ok) {
                 waitingForDrain = true;
             }
-
         } catch (error) {
             cleanup();
         }
-
     }, AUDIO_CHUNK_MS);
 
     function cleanup() {
-
         if (closed) return;
 
         closed = true;
@@ -1189,7 +1115,6 @@ app.get("/audio", (req, res) => {
         if (!res.destroyed) {
             res.end();
         }
-
     }
 
     res.on("drain", () => {
@@ -1197,17 +1122,13 @@ app.get("/audio", (req, res) => {
     });
 
     res.on("close", () => {
-
         closed = true;
-
         clearInterval(timer);
-
     });
 
     res.on("error", () => {
         cleanup();
     });
-
 });
 
 // =====================================================
@@ -1215,9 +1136,7 @@ app.get("/audio", (req, res) => {
 // =====================================================
 
 app.get("/health", (req, res) => {
-
     res.json({
-
         status: "ok",
 
         channels: channels.length,
@@ -1231,7 +1150,6 @@ app.get("/health", (req, res) => {
             : null,
 
         playing: !!ffmpeg,
-
         restarting: !!restartTimer,
 
         generation: ffmpegGeneration,
@@ -1241,50 +1159,44 @@ app.get("/health", (req, res) => {
             : null,
 
         memory: {
-
             latestFrameBytes: latestFrame
                 ? latestFrame.data.length
                 : 0,
 
             jpegParserBytes: jpegBuffer.length,
-
             audioBufferBytes: audioBuffer.length,
-
             audioBufferMax: AUDIO_BUFFER_MAX
-
         },
 
         video: {
-
             width: WIDTH,
             height: HEIGHT,
             fps: FPS,
             quality: JPEG_QUALITY,
-
             mode: "LATEST FRAME ONLY",
-
             endpoint: "/stream"
-
         },
 
         audio: {
-
             codec: "PCM_S16LE",
             sampleRate: AUDIO_SAMPLE_RATE,
             channels: AUDIO_CHANNELS,
             bits: AUDIO_BITS,
-
             bitrate: 256000,
-
             chunkMs: AUDIO_CHUNK_MS,
             bufferMs: 150,
-
             endpoint: "/audio"
+        },
 
+        reconnect: {
+            normalWatchdogMs: FRAME_TIMEOUT,
+            special720pWatchdogMs: FRAME_TIMEOUT_720P,
+            normalNetworkTimeout: NETWORK_TIMEOUT_NORMAL,
+            special720pNetworkTimeout: NETWORK_TIMEOUT_720P,
+            normalRestartDelay: FFMPEG_RESTART_DELAY,
+            special720pRestartDelay: RESTART_DELAY_720P
         }
-
     });
-
 });
 
 // =====================================================
@@ -1292,12 +1204,11 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.listen(PORT, "0.0.0.0", async () => {
-
     console.log("");
 
     console.log("======================================");
     console.log("ESP32 IPTV SERVER");
-    console.log("720P CONTROL MODE");
+    console.log("720P HLS RETRY MODE");
     console.log("======================================");
 
     console.log(`Port: ${PORT}`);
@@ -1318,8 +1229,12 @@ app.listen(PORT, "0.0.0.0", async () => {
     console.log("Video buffer: 1 latest frame");
     console.log("Audio buffer: 150ms");
 
-    console.log("720p readrate: 1x");
-    console.log("Other channels: Original input mode");
+    console.log("720p readrate: OFF");
+    console.log("720p watchdog: 75 seconds");
+    console.log("720p network timeout: 60 seconds");
+    console.log("720p HLS segment retry: ON");
+
+    console.log("Other channels: Original mode");
 
     console.log("Disk cache: OFF");
     console.log("Auto restart: ON");
@@ -1328,7 +1243,6 @@ app.listen(PORT, "0.0.0.0", async () => {
     console.log("======================================");
 
     try {
-
         console.log("Đang tải playlist...");
 
         const m3u = await downloadM3U(M3U_URL);
@@ -1338,12 +1252,10 @@ app.listen(PORT, "0.0.0.0", async () => {
         console.log("Tổng kênh:", channels.length);
 
         console.log("");
-
         console.log("======================================");
         console.log("SERVER READY");
 
         console.log("Channels:", channels.length);
-
         console.log("Chưa phát kênh nào.");
 
         console.log(
@@ -1367,14 +1279,10 @@ app.listen(PORT, "0.0.0.0", async () => {
         );
 
         console.log("======================================");
-
     } catch (error) {
-
         console.error(
-            "LỖI:",
+            "LỖI TẢI PLAYLIST:",
             error.message
         );
-
     }
-
 });

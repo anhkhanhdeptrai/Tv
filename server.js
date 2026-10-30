@@ -1,4 +1,4 @@
-
+Viết
 const express = require("express");
 const { spawn } = require("child_process");
 const https = require("https");
@@ -176,6 +176,7 @@ function downloadM3U(url) {
 
 // =====================================================
 // PARSE M3U
+// CHỈ LẤY KÊNH GEO-BLOCKED
 // =====================================================
 
 function parseM3U(text) {
@@ -220,21 +221,25 @@ function parseM3U(text) {
 
         if (!url) continue;
 
-        if (!name) {
-            name =
-                tvgName ||
-                tvgId ||
-                `Channel ${result.length + 1}`;
-        }
+        // KIỂM TRA NHÃN GEO-BLOCKED
+        const geoInfo = [
+            line,
+            name,
+            tvgName,
+            tvgId,
+            group
+        ].join(" ");
 
-        if (
-            line.includes("[Geo-blocked]") ||
-            name.includes("[Geo-blocked]")
-        ) {
+        const isGeoBlocked =
+            /\[Geo-blocked\]/i.test(geoInfo);
+
+        // BỎ TẤT CẢ KÊNH KHÔNG GEO-BLOCKED
+        if (!isGeoBlocked) {
             continue;
         }
 
-        if (url.toLowerCase().includes(".mpd")) {
+        // BỎ MPD
+        if (/\.mpd(?:$|[?#])/i.test(url)) {
             continue;
         }
 
@@ -245,9 +250,23 @@ function parseM3U(text) {
             tvgName,
             logo,
             group,
-            url
+            url,
+            geoBlocked: true
         });
     }
+
+    console.log("");
+    console.log("======================================");
+    console.log("GEO-BLOCKED FILTER");
+    console.log("TOTAL:", result.length);
+
+    result.forEach(channel => {
+        console.log(
+            `[${channel.id}] ${channel.name}`
+        );
+    });
+
+    console.log("======================================");
 
     return result;
 }
@@ -433,6 +452,7 @@ function launchFFmpeg(channel) {
     console.log("START CHANNEL:", channel.name);
     console.log("URL:", channel.url);
     console.log("GENERATION:", generation);
+    console.log("GEO-BLOCKED:", channel.geoBlocked);
     console.log("720P MODE:", special720p ? "ON" : "OFF");
     console.log(
         "WATCHDOG:",
@@ -448,14 +468,8 @@ function launchFFmpeg(channel) {
         "-hide_banner",
         "-loglevel", "warning",
 
-        // INPUT THREAD
         "-thread_queue_size", "512",
         "-threads", "2",
-
-        // =============================================
-        // NETWORK RECONNECT
-        // Tương thích FFmpeg cũ
-        // =============================================
 
         "-reconnect", "1",
         "-reconnect_streamed", "1",
@@ -467,20 +481,12 @@ function launchFFmpeg(channel) {
 
         "-user_agent", "Mozilla/5.0",
 
-        // TIMESTAMP
         "-fflags", "+genpts+discardcorrupt",
         "-err_detect", "ignore_err",
 
-        // =============================================
-        // INPUT
-        // =============================================
-
         "-i", channel.url,
 
-        // =============================================
-        // OUTPUT 1: VIDEO MJPEG
-        // =============================================
-
+        // VIDEO
         "-map", "0:v:0",
         "-an",
 
@@ -498,10 +504,7 @@ function launchFFmpeg(channel) {
         "-f", "image2pipe",
         "pipe:1",
 
-        // =============================================
-        // OUTPUT 2: AUDIO PCM S16LE
-        // =============================================
-
+        // AUDIO
         "-map", "0:a:0?",
         "-vn",
 
@@ -547,10 +550,7 @@ function launchFFmpeg(channel) {
 
     startWatchdog(channel, generation);
 
-    // =============================================
     // STDERR
-    // =============================================
-
     processFFmpeg.stderr.on("data", data => {
         if (
             generation !== ffmpegGeneration ||
@@ -566,10 +566,7 @@ function launchFFmpeg(channel) {
         }
     });
 
-    // =============================================
     // VIDEO JPEG PARSER
-    // =============================================
-
     processFFmpeg.stdout.on("data", chunk => {
         if (
             generation !== ffmpegGeneration ||
@@ -652,7 +649,6 @@ function launchFFmpeg(channel) {
 
             lastVideoFrameTime = now;
 
-            // FPS MONITOR
             frameCount++;
 
             if (now - lastFpsLog >= 5000) {
@@ -685,10 +681,7 @@ function launchFFmpeg(channel) {
         }
     });
 
-    // =============================================
-    // AUDIO PCM S16LE
-    // =============================================
-
+    // AUDIO PCM
     processFFmpeg.stdio[3].on("data", chunk => {
         if (
             generation !== ffmpegGeneration ||
@@ -702,7 +695,6 @@ function launchFFmpeg(channel) {
             chunk
         ]);
 
-        // GIỮ TỐI ĐA 150MS
         if (audioBuffer.length > AUDIO_BUFFER_MAX) {
             audioBuffer = audioBuffer.subarray(
                 audioBuffer.length - AUDIO_BUFFER_MAX
@@ -719,10 +711,7 @@ function launchFFmpeg(channel) {
         }
     });
 
-    // =============================================
     // PROCESS ERROR
-    // =============================================
-
     processFFmpeg.on("error", error => {
         if (generation !== ffmpegGeneration) {
             return;
@@ -734,10 +723,7 @@ function launchFFmpeg(channel) {
         );
     });
 
-    // =============================================
     // PROCESS CLOSE
-    // =============================================
-
     processFFmpeg.on("close", (code, signal) => {
         if (
             generation !== ffmpegGeneration ||
@@ -769,7 +755,11 @@ function launchFFmpeg(channel) {
 // =====================================================
 
 function startFFmpeg(channel) {
-    if (!channel || !channel.url) {
+    if (
+        !channel ||
+        !channel.url ||
+        channel.geoBlocked !== true
+    ) {
         return false;
     }
 
@@ -802,6 +792,8 @@ app.get("/api/channels", (req, res) => {
     res.json({
         count: channels.length,
 
+        filter: "GEO-BLOCKED ONLY",
+
         current: currentChannel
             ? currentChannel.id
             : null,
@@ -812,7 +804,8 @@ app.get("/api/channels", (req, res) => {
             id: channel.id,
             name: channel.name,
             group: channel.group,
-            logo: channel.logo
+            logo: channel.logo,
+            geoBlocked: channel.geoBlocked
         }))
     });
 });
@@ -829,7 +822,14 @@ app.get("/api/select/:id", (req, res) => {
     if (!channel) {
         return res.status(404).json({
             ok: false,
-            error: "Không tìm thấy kênh"
+            error: "Không tìm thấy kênh Geo-blocked"
+        });
+    }
+
+    if (channel.geoBlocked !== true) {
+        return res.status(403).json({
+            ok: false,
+            error: "Chỉ cho phép phát kênh Geo-blocked"
         });
     }
 
@@ -847,6 +847,7 @@ app.get("/api/select/:id", (req, res) => {
 
         id: channel.id,
         name: channel.name,
+        geoBlocked: true,
 
         video: "/stream",
         audio: "/audio",
@@ -1120,12 +1121,15 @@ app.get("/health", (req, res) => {
     res.json({
         status: "ok",
 
+        filter: "GEO-BLOCKED ONLY",
+
         channels: channels.length,
 
         current: currentChannel
             ? {
                 id: currentChannel.id,
                 name: currentChannel.name,
+                geoBlocked: currentChannel.geoBlocked,
                 special720p: is720pChannel(currentChannel)
             }
             : null,
@@ -1189,7 +1193,7 @@ app.listen(PORT, "0.0.0.0", async () => {
 
     console.log("======================================");
     console.log("ESP32 IPTV SERVER");
-    console.log("720P COMPATIBILITY MODE");
+    console.log("GEO-BLOCKED ONLY MODE");
     console.log("======================================");
 
     console.log(`Port: ${PORT}`);
@@ -1210,14 +1214,13 @@ app.listen(PORT, "0.0.0.0", async () => {
     console.log("Video buffer: 1 latest frame");
     console.log("Audio buffer: 150ms");
 
-    console.log("720p readrate: OFF");
+    console.log("Playlist filter: [Geo-blocked] ONLY");
+
     console.log("720p watchdog: 75 seconds");
     console.log("720p network timeout: 60 seconds");
     console.log("720p HLS retry: AUTO");
 
     console.log("FFmpeg reconnect: COMPATIBILITY MODE");
-    console.log("Other channels: Original mode");
-
     console.log("Disk cache: OFF");
     console.log("Auto restart: ON");
     console.log("Web UI: OFF");
@@ -1231,7 +1234,7 @@ app.listen(PORT, "0.0.0.0", async () => {
 
         channels = parseM3U(m3u);
 
-        console.log("Tổng kênh:", channels.length);
+        console.log("Tổng kênh Geo-blocked:", channels.length);
 
         console.log("");
         console.log("======================================");
@@ -1261,6 +1264,13 @@ app.listen(PORT, "0.0.0.0", async () => {
         );
 
         console.log("======================================");
+
+        if (channels.length === 0) {
+            console.log(
+                "KHÔNG TÌM THẤY KÊNH CÓ NHÃN [Geo-blocked]"
+            );
+        }
+
     } catch (error) {
         console.error(
             "LỖI TẢI PLAYLIST:",

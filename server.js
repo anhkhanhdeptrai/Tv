@@ -543,7 +543,7 @@ function startFFmpeg(channel) {
     "-vn",
 
     "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=1000:first_pts=0`,
+    `aresample=${AUDIO_SAMPLE_RATE}:async=100:first_pts=0`,
 
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),

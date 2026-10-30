@@ -4,6 +4,7 @@ const https = require("https");
 const http = require("http");
 
 const app = express();
+
 const PORT = process.env.PORT || 10000;
 
 const M3U_URL =
@@ -17,33 +18,33 @@ const WIDTH = 340;
 const HEIGHT = 230;
 const FPS = 8;
 
-// Chỉ giữ 2 frame mới nhất.
-// Không tích lũy frame cũ.
-const FRAME_BUFFER_SIZE = 2;
-
 const JPEG_QUALITY = 8;
+
+// Chỉ giữ đúng 1 frame mới nhất.
+// Không xếp hàng frame cũ.
+let latestFrame = null;
 
 // =====================================================
 // AUDIO
 // =====================================================
 
-const AUDIO_SAMPLE_RATE = 41000;
+const AUDIO_SAMPLE_RATE = 48000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 
-// ~100 ms audio
+// Giữ tối đa khoảng 200ms audio
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
-  0.6;
+  0.2;
 
-// 20 ms audio mỗi lần gửi
+// 20ms / chunk
 const AUDIO_CHUNK_SIZE =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
-  0.04;
+  0.02;
 
 // =====================================================
 // NETWORK
@@ -61,17 +62,15 @@ let currentChannel = null;
 
 let ffmpeg = null;
 
-// Generation dùng để loại hoàn toàn dữ liệu
-// từ FFmpeg cũ.
+// Mỗi FFmpeg có generation riêng.
+// Dữ liệu process cũ sẽ bị loại hoàn toàn.
 let ffmpegGeneration = 0;
 
 // =====================================================
-// VIDEO BUFFER
+// VIDEO PARSER
 // =====================================================
 
 let jpegBuffer = Buffer.alloc(0);
-
-const frames = [];
 
 const JPEG_START = Buffer.from([
   0xff,
@@ -104,8 +103,7 @@ function downloadM3U(url) {
       url,
       {
         headers: {
-          "User-Agent":
-            "Mozilla/5.0",
+          "User-Agent": "Mozilla/5.0",
           "Accept": "*/*"
         }
       },
@@ -133,6 +131,7 @@ function downloadM3U(url) {
                   `M3U HTTP ${response.statusCode}`
                 )
               );
+
               return;
             }
 
@@ -146,9 +145,7 @@ function downloadM3U(url) {
       M3U_TIMEOUT,
       () => {
         request.destroy(
-          new Error(
-            "M3U timeout"
-          )
+          new Error("M3U timeout")
         );
       }
     );
@@ -180,9 +177,7 @@ function parseM3U(text) {
     const line = lines[i];
 
     if (
-      !line.startsWith(
-        "#EXTINF"
-      )
+      !line.startsWith("#EXTINF")
     ) {
       continue;
     }
@@ -250,12 +245,8 @@ function parseM3U(text) {
 
     // Bỏ Geo-blocked
     if (
-      line.includes(
-        "[Geo-blocked]"
-      ) ||
-      name.includes(
-        "[Geo-blocked]"
-      )
+      line.includes("[Geo-blocked]") ||
+      name.includes("[Geo-blocked]")
     ) {
       continue;
     }
@@ -288,7 +279,7 @@ function parseM3U(text) {
 // =====================================================
 
 function clearVideoBuffer() {
-  frames.length = 0;
+  latestFrame = null;
   jpegBuffer = Buffer.alloc(0);
 }
 
@@ -314,7 +305,7 @@ function clearAllBuffers() {
 // =====================================================
 
 function stopFFmpeg() {
-  // Vô hiệu hóa ngay dữ liệu của process cũ.
+  // Vô hiệu hóa process cũ NGAY LẬP TỨC.
   ffmpegGeneration++;
 
   const oldFFmpeg = ffmpeg;
@@ -323,9 +314,7 @@ function stopFFmpeg() {
 
   if (oldFFmpeg) {
     try {
-      oldFFmpeg.kill(
-        "SIGKILL"
-      );
+      oldFFmpeg.kill("SIGKILL");
     } catch {}
   }
 
@@ -348,20 +337,23 @@ function startFFmpeg(channel) {
   console.log(
     "======================================"
   );
+
   console.log(
     "START CHANNEL:",
     channel.name
   );
+
   console.log(
     "URL:",
     channel.url
   );
+
   console.log(
     "======================================"
   );
 
   // ---------------------------------------------------
-  // Xóa hoàn toàn kênh cũ trước khi mở kênh mới
+  // Dừng process cũ hoàn toàn
   // ---------------------------------------------------
 
   currentChannel = null;
@@ -383,7 +375,10 @@ function startFFmpeg(channel) {
     "-loglevel",
     "warning",
 
-    // HTTP/HLS reconnect
+    // =================================================
+    // HLS / HTTP RECONNECT
+    // =================================================
+
     "-reconnect",
     "1",
 
@@ -393,12 +388,27 @@ function startFFmpeg(channel) {
     "-reconnect_delay_max",
     "3",
 
-    // Input
+    // =================================================
+    // TIMESTAMP
+    // =================================================
+
+    "-fflags",
+    "+genpts+discardcorrupt",
+
+    "-flags",
+    "low_delay",
+
+    // =================================================
+    // REALTIME INPUT
+    // =================================================
+
+    "-re",
+
     "-i",
     channel.url,
 
     // =================================================
-    // VIDEO OUTPUT
+    // VIDEO
     // =================================================
 
     "-map",
@@ -407,7 +417,10 @@ function startFFmpeg(channel) {
     "-an",
 
     "-vf",
-    `fps=${FPS}:round=down,scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=yuvj420p`,
+    `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=yuvj420p`,
+
+    "-r",
+    String(FPS),
 
     "-c:v",
     "mjpeg",
@@ -430,7 +443,7 @@ function startFFmpeg(channel) {
     "pipe:1",
 
     // =================================================
-    // AUDIO OUTPUT
+    // AUDIO
     // =================================================
 
     "-map",
@@ -467,8 +480,7 @@ function startFFmpeg(channel) {
       }
     );
 
-  ffmpeg =
-    processFFmpeg;
+  ffmpeg = processFFmpeg;
 
   // =================================================
   // STDERR
@@ -526,7 +538,7 @@ function startFFmpeg(channel) {
           );
 
         if (start === -1) {
-          // Không cho parser phình RAM
+          // Không cho buffer lỗi phình RAM
           if (
             jpegBuffer.length >
             512 * 1024
@@ -541,9 +553,7 @@ function startFFmpeg(channel) {
         // Bỏ dữ liệu trước JPEG
         if (start > 0) {
           jpegBuffer =
-            jpegBuffer.slice(
-              start
-            );
+            jpegBuffer.slice(start);
         }
 
         const end =
@@ -574,32 +584,22 @@ function startFFmpeg(channel) {
           jpeg.length < 100 ||
           jpeg[0] !== 0xff ||
           jpeg[1] !== 0xd8 ||
-          jpeg[
-            jpeg.length - 2
-          ] !== 0xff ||
-          jpeg[
-            jpeg.length - 1
-          ] !== 0xd9
+          jpeg[jpeg.length - 2] !== 0xff ||
+          jpeg[jpeg.length - 1] !== 0xd9
         ) {
           continue;
         }
 
-        // ------------------------------------------------
-        // Chỉ giữ frame mới
-        // ------------------------------------------------
+        // =================================================
+        // QUAN TRỌNG:
+        // CHỈ GIỮ FRAME CUỐI CÙNG
+        // =================================================
 
-        frames.push({
+        latestFrame = {
           data: jpeg,
           time: Date.now(),
           generation
-        });
-
-        while (
-          frames.length >
-          FRAME_BUFFER_SIZE
-        ) {
-          frames.shift();
-        }
+        };
       }
     }
   );
@@ -625,16 +625,16 @@ function startFFmpeg(channel) {
           chunk
         ]);
 
-      // ------------------------------------------------
-      // QUAN TRỌNG:
-      // Không bao giờ để audio buffer tăng vô hạn.
-      // Chỉ giữ ~100ms gần nhất.
-      // ------------------------------------------------
+      // =================================================
+      // KHÔNG CHO AUDIO TÍCH LŨY
+      // =================================================
 
       if (
         audioBuffer.length >
         AUDIO_BUFFER_MAX
       ) {
+        // Bỏ audio cũ.
+        // Chỉ giữ phần mới nhất.
         audioBuffer =
           audioBuffer.slice(
             audioBuffer.length -
@@ -677,6 +677,13 @@ function startFFmpeg(channel) {
   processFFmpeg.on(
     "error",
     error => {
+      if (
+        generation !==
+        ffmpegGeneration
+      ) {
+        return;
+      }
+
       console.log(
         "FFmpeg error:",
         error.message
@@ -795,8 +802,7 @@ app.get(
 app.get(
   "/api/stop",
   (req, res) => {
-    currentChannel =
-      null;
+    currentChannel = null;
 
     stopFFmpeg();
 
@@ -846,6 +852,11 @@ app.get(
     );
 
     res.setHeader(
+      "Expires",
+      "0"
+    );
+
+    res.setHeader(
       "Connection",
       "keep-alive"
     );
@@ -863,10 +874,16 @@ app.get(
 
     let closed = false;
 
-    let waitingForDrain =
-      false;
+    let waitingForDrain = false;
 
     let lastFrameTime = 0;
+
+    // =================================================
+    // Gửi frame theo CLOCK của server
+    // =================================================
+
+    const interval =
+      1000 / FPS;
 
     const timer =
       setInterval(
@@ -875,9 +892,7 @@ app.get(
             closed ||
             res.destroyed
           ) {
-            clearInterval(
-              timer
-            );
+            clearInterval(timer);
             return;
           }
 
@@ -894,30 +909,21 @@ app.get(
             return;
           }
 
-          // Luôn lấy frame mới nhất
-          let frame = null;
-
-          for (
-            let i =
-              frames.length - 1;
-            i >= 0;
-            i--
-          ) {
-            if (
-              frames[i]
-                .generation ===
-              ffmpegGeneration
-            ) {
-              frame =
-                frames[i];
-              break;
-            }
-          }
+          const frame =
+            latestFrame;
 
           if (!frame) {
             return;
           }
 
+          if (
+            frame.generation !==
+            ffmpegGeneration
+          ) {
+            return;
+          }
+
+          // Không gửi lại cùng frame
           if (
             frame.time ===
             lastFrameTime
@@ -932,23 +938,29 @@ app.get(
             const header =
               Buffer.from(
                 "--frame\r\n" +
-                  "Content-Type: image/jpeg\r\n" +
-                  "Content-Length: " +
-                  frame.data.length +
-                  "\r\n\r\n"
+                "Content-Type: image/jpeg\r\n" +
+                "Content-Length: " +
+                frame.data.length +
+                "\r\n\r\n"
               );
 
-            res.write(header);
+            const ok1 =
+              res.write(header);
 
-            res.write(
-              frame.data
-            );
+            const ok2 =
+              res.write(
+                frame.data
+              );
 
-            res.write(
-              "\r\n"
-            );
+            const ok3 =
+              res.write(
+                "\r\n"
+              );
 
             if (
+              !ok1 ||
+              !ok2 ||
+              !ok3 ||
               res.writableNeedDrain
             ) {
               waitingForDrain =
@@ -957,13 +969,19 @@ app.get(
           } catch {
             closed = true;
 
-            clearInterval(
-              timer
-            );
+            clearInterval(timer);
+
+            try {
+              res.end();
+            } catch {}
           }
         },
-        1000 / FPS
+        interval
       );
+
+    // =================================================
+    // BACKPRESSURE
+    // =================================================
 
     res.on(
       "drain",
@@ -973,14 +991,16 @@ app.get(
       }
     );
 
+    // =================================================
+    // CLIENT CLOSE
+    // =================================================
+
     req.on(
       "close",
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
 
@@ -989,9 +1009,16 @@ app.get(
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
+      }
+    );
+
+    res.on(
+      "error",
+      () => {
+        closed = true;
+
+        clearInterval(timer);
       }
     );
   }
@@ -1016,14 +1043,6 @@ app.get(
     }
 
     res.statusCode = 200;
-
-    /*
-     * PCM S16LE
-     *
-     * 16000 Hz
-     * Mono
-     * 16 bit
-     */
 
     res.setHeader(
       "Content-Type",
@@ -1065,6 +1084,11 @@ app.get(
     );
 
     res.setHeader(
+      "Expires",
+      "0"
+    );
+
+    res.setHeader(
       "Connection",
       "keep-alive"
     );
@@ -1078,8 +1102,11 @@ app.get(
 
     let closed = false;
 
-    let waitingForDrain =
-      false;
+    let waitingForDrain = false;
+
+    // =================================================
+    // AUDIO CLOCK
+    // =================================================
 
     const timer =
       setInterval(
@@ -1088,9 +1115,7 @@ app.get(
             closed ||
             res.destroyed
           ) {
-            clearInterval(
-              timer
-            );
+            clearInterval(timer);
             return;
           }
 
@@ -1130,20 +1155,29 @@ app.get(
             const ok =
               res.write(chunk);
 
-            if (!ok) {
+            if (
+              !ok ||
+              res.writableNeedDrain
+            ) {
               waitingForDrain =
                 true;
             }
           } catch {
             closed = true;
 
-            clearInterval(
-              timer
-            );
+            clearInterval(timer);
+
+            try {
+              res.end();
+            } catch {}
           }
         },
         20
       );
+
+    // =================================================
+    // BACKPRESSURE
+    // =================================================
 
     res.on(
       "drain",
@@ -1153,14 +1187,16 @@ app.get(
       }
     );
 
+    // =================================================
+    // CLIENT CLOSE
+    // =================================================
+
     req.on(
       "close",
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
 
@@ -1169,9 +1205,16 @@ app.get(
       () => {
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
+      }
+    );
+
+    res.on(
+      "error",
+      () => {
+        closed = true;
+
+        clearInterval(timer);
       }
     );
   }
@@ -1204,11 +1247,16 @@ app.get(
       playing:
         !!ffmpeg,
 
-      memory: {
-        videoFrames:
-          frames.length,
+      generation:
+        ffmpegGeneration,
 
-        videoBufferBytes:
+      memory: {
+        latestFrameBytes:
+          latestFrame
+            ? latestFrame.data.length
+            : 0,
+
+        jpegParserBytes:
           jpegBuffer.length,
 
         audioBufferBytes:
@@ -1224,8 +1272,10 @@ app.get(
         fps: FPS,
         quality:
           JPEG_QUALITY,
-        buffer:
-          FRAME_BUFFER_SIZE,
+
+        mode:
+          "LATEST FRAME ONLY",
+
         endpoint:
           "/stream"
       },
@@ -1233,11 +1283,17 @@ app.get(
       audio: {
         codec:
           "PCM S16LE",
+
         sampleRate:
           AUDIO_SAMPLE_RATE,
+
         channels:
           AUDIO_CHANNELS,
+
         bits: 16,
+
+        chunkMs: 20,
+
         endpoint:
           "/audio"
       }
@@ -1264,7 +1320,7 @@ app.listen(
     );
 
     console.log(
-      "LOW CACHE / LOW LATENCY"
+      "REALTIME / LOW LATENCY"
     );
 
     console.log(
@@ -1285,6 +1341,14 @@ app.listen(
 
     console.log(
       `Audio: PCM ${AUDIO_SAMPLE_RATE}Hz Mono 16-bit`
+    );
+
+    console.log(
+      "Frame cache: 1 frame"
+    );
+
+    console.log(
+      "Audio cache: ~200ms"
     );
 
     console.log(
@@ -1349,11 +1413,19 @@ app.listen(
       );
 
       console.log(
+        `Select: http://SERVER:${PORT}/api/select/ID`
+      );
+
+      console.log(
         `Video: http://SERVER:${PORT}/stream`
       );
 
       console.log(
         `Audio: http://SERVER:${PORT}/audio`
+      );
+
+      console.log(
+        `Health: http://SERVER:${PORT}/health`
       );
 
       console.log(

@@ -28,7 +28,7 @@ let latestFrame = null;
 // AUDIO
 // =====================================================
 
-const AUDIO_SAMPLE_RATE = 48000;
+const AUDIO_SAMPLE_RATE = 44100;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 

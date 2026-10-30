@@ -39,12 +39,12 @@ const AUDIO_BUFFER_MAX =
   AUDIO_BYTES_PER_SAMPLE *
   0.2;
 
-// 20ms / chunk
+// 10ms / chunk: phát gần như real-time, không để tiếng đọng kéo dài.
 const AUDIO_CHUNK_SIZE =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
-  0.02;
+  0.01;
 
 // =====================================================
 // NETWORK
@@ -450,6 +450,9 @@ function startFFmpeg(channel) {
     "0:a:0?",
 
     "-vn",
+
+    "-af",
+    "aresample=async=1:min_hard_comp=0.100000:first_pts=0",
 
     "-ac",
     String(AUDIO_CHANNELS),

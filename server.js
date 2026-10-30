@@ -27,6 +27,7 @@ const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 
 const AUDIO_FRAME_MS = 20;
+const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 
 const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE *
@@ -42,12 +43,15 @@ const AUDIO_BUFFER_MAX =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_BUFFER_MS / 1000;
 
-// Decoder optimization
+// Decoder / encoder
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
 
-// Skip non-reference frames to reduce decoder workload
-const SKIP_NON_REFERENCE = true;
+// Không bỏ frame tham chiếu
+const SKIP_NON_REFERENCE = false;
+
+// Đọc nguồn theo tốc độ media
+const INPUT_READRATE = "1";
 
 // Watchdog
 const WATCHDOG_INTERVAL = 5000;
@@ -234,6 +238,7 @@ function pushAudioBuffer(chunk) {
     chunk
   ]);
 
+  // Không để audio buffer tăng vô hạn
   if (audioBuffer.length > AUDIO_BUFFER_MAX) {
     const excess =
       audioBuffer.length - AUDIO_BUFFER_MAX;
@@ -257,6 +262,7 @@ function getAudioFrame() {
     return frame;
   }
 
+  // Nếu thiếu dữ liệu, đệm phần còn lại bằng silence
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES);
 
   if (audioBuffer.length > 0) {
@@ -285,7 +291,6 @@ function startAudioTimer() {
     if (audioBlocked) {
       if (Date.now() - audioBlockedSince > 1500) {
         console.log("[AUDIO] Slow client disconnected");
-
         disconnectAudioClient();
       }
 
@@ -374,6 +379,8 @@ function processVideoData(chunk, currentGeneration) {
       end + 2
     );
 
+    // Chỉ giữ frame mới nhất.
+    // Trình duyệt sẽ nhận theo nhịp VIDEO_INTERVAL.
     latestFrame = Buffer.from(jpeg);
 
     frameSequence++;
@@ -443,13 +450,12 @@ function startFFmpeg(channel) {
   console.log("START CHANNEL:", channel.name);
   console.log("URL:", channel.url);
   console.log("GENERATION:", currentGeneration);
-  console.log("SOURCE: ORIGINAL RESOLUTION");
+  console.log("READRATE:", INPUT_READRATE);
   console.log("DECODER THREADS:", DECODER_THREADS);
   console.log("SKIP NONREF:", SKIP_NON_REFERENCE);
   console.log("OUTPUT:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
   console.log("FPS:", VIDEO_FPS);
   console.log("AUDIO:", AUDIO_SAMPLE_RATE, "Hz");
-  console.log("LIVE HLS MODE: ON");
   console.log("======================================");
 
   lastVideoFrameTime = Date.now();
@@ -470,19 +476,23 @@ function startFFmpeg(channel) {
 
     "-reconnect", "1",
     "-reconnect_streamed", "1",
-    "-reconnect_at_eof", "1",
-    "-reconnect_delay_max", "10",
+    "-reconnect_delay_max", "5",
 
     "-user_agent",
     "Mozilla/5.0",
 
-    // Discard corrupted packets
     "-fflags",
     "+discardcorrupt+genpts",
 
     // ===============================================
-    // DECODER OPTIMIZATION
-    // These options must be BEFORE -i
+    // INPUT RATE CONTROL
+    // ===============================================
+
+    "-readrate",
+    INPUT_READRATE,
+
+    // ===============================================
+    // DECODER
     // ===============================================
 
     "-threads",
@@ -494,7 +504,6 @@ function startFFmpeg(channel) {
 
     // ===============================================
     // INPUT
-    // No -re: HLS is already a live network source.
     // ===============================================
 
     "-i", channel.url,
@@ -506,8 +515,6 @@ function startFFmpeg(channel) {
     "-map", "0:v:0?",
     "-an",
 
-    // Drop frames before scaling.
-    // Fast scaler reduces CPU workload.
     "-vf",
     [
       `fps=${VIDEO_FPS}:round=near`,
@@ -535,7 +542,6 @@ function startFFmpeg(channel) {
     "-map", "0:a:0?",
     "-vn",
 
-    // Synchronize samples to source timestamps.
     "-af",
     `aresample=${AUDIO_SAMPLE_RATE}:async=1000:first_pts=0`,
 
@@ -700,7 +706,7 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM
+// VIDEO STREAM - MJPEG
 // =====================================================
 
 app.get("/stream", (req, res) => {
@@ -712,7 +718,8 @@ app.get("/stream", (req, res) => {
       "no-cache, no-store, must-revalidate",
 
     "Pragma": "no-cache",
-    "Connection": "keep-alive"
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no"
   });
 
   let lastSentSequence = -1;
@@ -720,7 +727,7 @@ app.get("/stream", (req, res) => {
   let blockedSince = 0;
 
   const timer = setInterval(() => {
-    if (res.destroyed) {
+    if (res.destroyed || res.writableEnded) {
       clearInterval(timer);
       return;
     }
@@ -741,7 +748,6 @@ app.get("/stream", (req, res) => {
     }
 
     const frame = latestFrame;
-
     lastSentSequence = frameSequence;
 
     const header = Buffer.from(
@@ -777,7 +783,7 @@ app.get("/stream", (req, res) => {
 
   }, VIDEO_INTERVAL);
 
-  req.on("close", () => {
+  res.on("close", () => {
     clearInterval(timer);
   });
 });
@@ -813,10 +819,9 @@ app.get("/audio", (req, res) => {
 
   startAudioTimer();
 
-  req.on("close", () => {
+  res.on("close", () => {
     if (audioClient === res) {
       console.log("[AUDIO] Client disconnected");
-
       disconnectAudioClient();
     }
   });
@@ -921,7 +926,9 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "OPTIMIZED_LIVE_HLS",
+    pipeline: "REALTIME_HLS_MJPEG",
+
+    inputReadrate: INPUT_READRATE,
 
     sourceResolution: "ORIGINAL",
 
@@ -929,7 +936,6 @@ app.get("/health", (req, res) => {
       SKIP_NON_REFERENCE,
 
     decoderThreads: DECODER_THREADS,
-
     encoderThreads: ENCODER_THREADS,
 
     videoWidth: VIDEO_WIDTH,
@@ -940,6 +946,7 @@ app.get("/health", (req, res) => {
     audioChannels: AUDIO_CHANNELS,
 
     audioFrameBytes: AUDIO_FRAME_BYTES,
+    audioInterval: AUDIO_INTERVAL,
 
     audioBufferBytes: audioBuffer.length,
     audioBufferMax: AUDIO_BUFFER_MAX,
@@ -948,6 +955,10 @@ app.get("/health", (req, res) => {
       !!audioClient && !audioClient.destroyed,
 
     lastVideoFrameTime,
+
+    videoFrameAge: lastVideoFrameTime
+      ? Date.now() - lastVideoFrameTime
+      : null,
 
     generation
   });
@@ -959,21 +970,27 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(`
-    <h2>IPTV Streaming Server</h2>
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>IPTV Streaming Server</title>
+    </head>
+    <body style="background:#111;color:#eee;font-family:Arial;padding:20px">
+      <h2>IPTV Streaming Server</h2>
 
-    <p>Channels: ${channels.length}</p>
+      <p>Channels: ${channels.length}</p>
+      <p>Pipeline: REALTIME HLS MJPEG</p>
+      <p>Source: Original resolution</p>
+      <p>Input readrate: ${INPUT_READRATE}</p>
+      <p>Video: ${VIDEO_WIDTH}x${VIDEO_HEIGHT} @ ${VIDEO_FPS} FPS</p>
+      <p>Audio: ${AUDIO_SAMPLE_RATE}Hz PCM</p>
 
-    <p>Pipeline: OPTIMIZED LIVE HLS</p>
-
-    <p>Source: Original resolution</p>
-
-    <p>Video: ${VIDEO_WIDTH}x${VIDEO_HEIGHT} @ ${VIDEO_FPS} FPS</p>
-
-    <p>Audio: ${AUDIO_SAMPLE_RATE}Hz PCM</p>
-
-    <p><a href="/api/channels">Channels</a></p>
-
-    <p><a href="/health">Health</a></p>
+      <p><a style="color:#8b7cff" href="/api/channels">Channels</a></p>
+      <p><a style="color:#8b7cff" href="/health">Health</a></p>
+    </body>
+    </html>
   `);
 });
 
@@ -997,9 +1014,9 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-    console.log("PIPELINE: OPTIMIZED LIVE HLS");
+    console.log("PIPELINE: REALTIME HLS MJPEG");
+    console.log("INPUT READRATE:", INPUT_READRATE);
     console.log("SOURCE: ORIGINAL RESOLUTION");
-    console.log("SKIP NONREF:", SKIP_NON_REFERENCE);
     console.log("VIDEO:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
     console.log("FPS:", VIDEO_FPS);
     console.log("AUDIO:", AUDIO_SAMPLE_RATE);

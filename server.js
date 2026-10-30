@@ -1,6 +1,5 @@
 const express = require("express");
 const { spawn } = require("child_process");
-const fetch = require("node-fetch");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -20,21 +19,23 @@ const WIDTH = 320;
 const HEIGHT = 240;
 const FPS = 10;
 
-// Chỉ giữ ít frame mới nhất.
-// Không tích hàng chục giây gây delay.
+// Chỉ giữ frame mới nhất để tránh delay.
+// 3 frame ~= 0.3 giây ở 10 FPS.
 const FRAME_BUFFER_SIZE = 3;
 
-// Audio buffer
+// Audio buffer tối đa
 const MAX_AUDIO_BUFFER = 256 * 1024;
 
 // HLS
 const HLS_TIME = 2;
 const HLS_LIST = 6;
 
-// CHECK
-// Đây KHÔNG phải số lượng kênh.
-// Chỉ là số kênh được check đồng thời.
+// Kiểm tra kênh
+// Đây là số worker chạy đồng thời,
+// KHÔNG phải giới hạn tổng số kênh.
 const CHECK_CONCURRENCY = 20;
+
+// Timeout mỗi kênh
 const CHECK_TIMEOUT = 2000;
 
 
@@ -42,29 +43,26 @@ const CHECK_TIMEOUT = 2000;
 // GLOBAL
 // ============================================================
 
-// TẤT CẢ KÊNH từ M3U
 let channels = [];
 
-let currentIndex = 0;
+let currentIndex = -1;
 let currentChannel = null;
 
-// Session tăng mỗi lần đổi kênh.
-// Dùng để tuyệt đối không trộn kênh.
 let sessionId = 0;
 
-// FFmpeg hiện tại
+// FFmpeg
 let videoProcess = null;
 let hlsProcess = null;
 let audioProcess = null;
 
-// Frame buffer MJPEG
+// MJPEG frame buffer
 let frameBuffer = [];
 
 // Audio buffer
 let audioQueue = [];
 let audioBytes = 0;
 
-// HLS thư mục hiện tại
+// HLS directory
 let currentHlsDir = null;
 
 // MJPEG clients
@@ -112,7 +110,7 @@ function log(...args) {
 
 
 // ============================================================
-// LOAD M3U
+// LOAD PLAYLIST
 // ============================================================
 
 async function loadPlaylist() {
@@ -123,6 +121,7 @@ async function loadPlaylist() {
     await fetch(PLAYLIST_URL);
 
   if (!response.ok) {
+
     throw new Error(
       `M3U HTTP ${response.status}`
     );
@@ -146,6 +145,10 @@ async function loadPlaylist() {
     if (!line) {
       continue;
     }
+
+    // --------------------------------------------------------
+    // EXTINF
+    // --------------------------------------------------------
 
     if (
       line.startsWith("#EXTINF")
@@ -192,20 +195,28 @@ async function loadPlaylist() {
       continue;
     }
 
+    // --------------------------------------------------------
+    // URL
+    // --------------------------------------------------------
+
     if (
       !line.startsWith("#") &&
       info
     ) {
 
       result.push({
+
         ...info,
 
         url: line,
 
-        // Mặc định chưa check
+        // null = chưa check
+        // true = live
+        // false = dead
         live: null,
 
         error: null
+
       });
 
       info = null;
@@ -275,7 +286,6 @@ function checkChannel(channel) {
           "-probesize",
           "500k",
 
-          // timeout network
           "-rw_timeout",
           "2000000",
 
@@ -303,10 +313,12 @@ function checkChannel(channel) {
       timer =
         setTimeout(
           () => {
+
             finish(
               false,
               "timeout"
             );
+
           },
           CHECK_TIMEOUT
         );
@@ -332,24 +344,6 @@ function checkChannel(channel) {
         }
       );
 
-      ff.stderr.on(
-        "data",
-        data => {
-
-          const errorText =
-            data.toString()
-              .trim();
-
-          if (
-            errorText &&
-            !output
-          ) {
-            // Chỉ lưu để tham khảo,
-            // không kết luận chết ngay.
-          }
-        }
-      );
-
       ff.on(
         "close",
         code => {
@@ -358,11 +352,14 @@ function checkChannel(channel) {
             return;
           }
 
-          if (
-            code === 0 &&
+          const hasVideo =
             output
               .toLowerCase()
-              .includes("video")
+              .includes("video");
+
+          if (
+            code === 0 &&
+            hasVideo
           ) {
 
             finish(
@@ -405,10 +402,7 @@ function checkChannel(channel) {
 // ============================================================
 // CHECK ALL CHANNELS
 //
-// QUAN TRỌNG:
-// - Không xóa kênh khỏi channels.
-// - channels vẫn chứa TOÀN BỘ M3U.
-// - live chỉ được cập nhật.
+// TẤT CẢ KÊNH VẪN GIỮ TRONG channels.
 // ============================================================
 
 async function checkAllChannels() {
@@ -418,7 +412,7 @@ async function checkAllChannels() {
   );
 
   log(
-    `[CHECK] Concurrency = ${CHECK_CONCURRENCY}`
+    `[CHECK] Concurrency: ${CHECK_CONCURRENCY}`
   );
 
   let nextIndex = 0;
@@ -448,8 +442,6 @@ async function checkAllChannels() {
           channel
         );
 
-      // Cập nhật trực tiếp vào
-      // đúng phần tử trong channels
       channel.live =
         result.ok;
 
@@ -467,7 +459,7 @@ async function checkAllChannels() {
       } else {
 
         log(
-          `[DEAD] ${channel.name} (${result.error})`
+          `[DEAD] ${channel.name} - ${result.error}`
         );
       }
     }
@@ -475,13 +467,15 @@ async function checkAllChannels() {
 
   const workers = [];
 
-  for (
-    let i = 0;
-    i <
+  const workerCount =
     Math.min(
       CHECK_CONCURRENCY,
       channels.length
     );
+
+  for (
+    let i = 0;
+    i < workerCount;
     i++
   ) {
 
@@ -499,8 +493,25 @@ async function checkAllChannels() {
       c => c.live === true
     ).length;
 
+  const deadCount =
+    channels.filter(
+      c => c.live === false
+    ).length;
+
   log(
-    `[CHECK] Finished: ${liveCount}/${channels.length} live`
+    `[CHECK] Finished`
+  );
+
+  log(
+    `[CHECK] Total: ${channels.length}`
+  );
+
+  log(
+    `[CHECK] Live: ${liveCount}`
+  );
+
+  log(
+    `[CHECK] Dead: ${deadCount}`
   );
 }
 
@@ -509,9 +520,7 @@ async function checkAllChannels() {
 // HLS DIRECTORY
 // ============================================================
 
-function createHlsDirectory(
-  id
-) {
+function createHlsDirectory(id) {
 
   const dir =
     path.join(
@@ -530,9 +539,7 @@ function createHlsDirectory(
 }
 
 
-function removeHlsDirectory(
-  dir
-) {
+function removeHlsDirectory(dir) {
 
   if (!dir) {
     return;
@@ -556,9 +563,7 @@ function removeHlsDirectory(
 // KILL PROCESS
 // ============================================================
 
-function killProcess(
-  proc
-) {
+function killProcess(proc) {
 
   if (!proc) {
     return;
@@ -571,13 +576,13 @@ function killProcess(
 
 
 // ============================================================
-// STOP CURRENT SESSION
+// STOP SESSION
 // ============================================================
 
 function stopCurrentSession() {
 
   log(
-    "[SESSION] Stop old session"
+    "[SESSION] Stopping old session"
   );
 
   killProcess(
@@ -596,10 +601,10 @@ function stopCurrentSession() {
   hlsProcess = null;
   audioProcess = null;
 
-  // Xóa toàn bộ frame cũ
+  // Xóa frame cũ
   frameBuffer = [];
 
-  // Xóa toàn bộ audio cũ
+  // Xóa audio cũ
   audioQueue = [];
   audioBytes = 0;
 
@@ -731,7 +736,7 @@ function updateFPS() {
 
 
 // ============================================================
-// START VIDEO
+// START VIDEO / MJPEG
 // ============================================================
 
 function startVideo(
@@ -779,7 +784,6 @@ function startVideo(
         "-i",
         channel.url,
 
-        // VIDEO ONLY
         "-map",
         "0:v:0",
 
@@ -831,8 +835,6 @@ function startVideo(
     "data",
     chunk => {
 
-      // Không nhận dữ liệu
-      // từ session cũ
       if (
         mySession !== sessionId
       ) {
@@ -921,9 +923,9 @@ function startVideo(
           return;
         }
 
-        // ====================================================
-        // FRAME BUFFER NHỎ
-        // ====================================================
+        // ----------------------------------------------------
+        // CHỈ GIỮ 3 FRAME GẦN NHẤT
+        // ----------------------------------------------------
 
         frameBuffer.push({
           data: jpeg,
@@ -983,7 +985,7 @@ function startVideo(
           null;
       }
 
-      // Chỉ restart session hiện tại
+      // Restart nếu stream hiện tại chết
       if (
         currentChannel &&
         mySession === sessionId
@@ -993,8 +995,8 @@ function startVideo(
           () => {
 
             if (
-              mySession === sessionId &&
-              currentChannel
+              currentChannel &&
+              mySession === sessionId
             ) {
 
               startVideo(
@@ -1179,6 +1181,7 @@ function startHLS(
           () => {
 
             if (
+              currentChannel &&
               mySession === sessionId
             ) {
 
@@ -1364,6 +1367,7 @@ function startAudio(
           () => {
 
             if (
+              currentChannel &&
               mySession === sessionId
             ) {
 
@@ -1402,9 +1406,7 @@ function startAudio(
 // START CHANNEL
 // ============================================================
 
-function startChannel(
-  index
-) {
+function startChannel(index) {
 
   if (
     !channels.length
@@ -1419,6 +1421,21 @@ function startChannel(
     return false;
   }
 
+  const channel =
+    channels[index];
+
+  // Không cho phát kênh đã xác định chết
+  if (
+    channel.live === false
+  ) {
+
+    log(
+      `[CHANNEL] Refusing dead channel: ${channel.name}`
+    );
+
+    return false;
+  }
+
   // ----------------------------------------------------------
   // SESSION MỚI
   // ----------------------------------------------------------
@@ -1429,7 +1446,7 @@ function startChannel(
     sessionId;
 
   // ----------------------------------------------------------
-  // DỪNG SESSION CŨ
+  // STOP CŨ
   // ----------------------------------------------------------
 
   stopCurrentSession();
@@ -1438,7 +1455,7 @@ function startChannel(
     index;
 
   currentChannel =
-    channels[index];
+    channel;
 
   log(
     "================================================"
@@ -1454,10 +1471,6 @@ function startChannel(
 
   log(
     `[LIVE] ${currentChannel.live}`
-  );
-
-  log(
-    `[URL] ${currentChannel.url}`
   );
 
   log(
@@ -1498,7 +1511,7 @@ function startChannel(
 
 
 // ============================================================
-// NEXT CHANNEL
+// FIND NEXT LIVE CHANNEL
 // ============================================================
 
 function nextChannel() {
@@ -1509,18 +1522,30 @@ function nextChannel() {
     return false;
   }
 
-  let index =
-    currentIndex + 1;
-
-  if (
-    index >= channels.length
+  // Tìm tối đa toàn bộ playlist
+  for (
+    let step = 1;
+    step <= channels.length;
+    step++
   ) {
-    index = 0;
+
+    const index =
+      (
+        currentIndex +
+        step
+      ) % channels.length;
+
+    if (
+      channels[index].live === true
+    ) {
+
+      return startChannel(
+        index
+      );
+    }
   }
 
-  return startChannel(
-    index
-  );
+  return false;
 }
 
 
@@ -1581,11 +1606,10 @@ app.get(
 
 
 // ============================================================
-// STABLE MJPEG OUTPUT
+// MJPEG BROADCAST
 //
-// Bộ phát cố định 10 FPS.
-// Không lấy trực tiếp frame từ pipe.
-// Luôn lấy frame MỚI NHẤT.
+// Không gửi trực tiếp frame từ FFmpeg.
+// Luôn lấy frame mới nhất.
 // ============================================================
 
 setInterval(
@@ -1610,14 +1634,9 @@ setInterval(
       const client of mjpegClients
     ) {
 
-      // ------------------------------------------------------
-      // Khi đổi kênh:
-      // reset client sang session mới.
-      // ------------------------------------------------------
-
+      // Session cũ
       if (
-        client.session !==
-        sessionId
+        client.session !== sessionId
       ) {
 
         client.session =
@@ -1629,10 +1648,7 @@ setInterval(
         continue;
       }
 
-      // ------------------------------------------------------
-      // Không gửi cùng frame 2 lần
-      // ------------------------------------------------------
-
+      // Không gửi lại frame
       if (
         client.lastFrame ===
         frame.time
@@ -1716,7 +1732,7 @@ app.get(
         .send(
           "HLS not ready"
         );
-        }
+    }
 
     try {
 
@@ -1845,14 +1861,21 @@ app.get(
           url:
             channel.url,
 
-          // null = chưa check
-          // true = sống
-          // false = chết
+          // null = checking
+          // true = live
+          // false = dead
           live:
             channel.live,
 
           error:
-            channel.error
+            channel.error,
+
+          status:
+            channel.live === true
+              ? "live"
+              : channel.live === false
+                ? "dead"
+                : "checking"
 
         })
       )
@@ -1862,7 +1885,7 @@ app.get(
 
 
 // ============================================================
-// CURRENT CHANNEL
+// CURRENT
 // ============================================================
 
 app.get(
@@ -1917,10 +1940,47 @@ app.post(
       return res
         .status(400)
         .json({
+
           ok: false,
 
           error:
             "Invalid channel"
+        });
+    }
+
+    const channel =
+      channels[index];
+
+    if (
+      channel.live === null
+    ) {
+
+      return res
+        .status(409)
+        .json({
+
+          ok: false,
+
+          error:
+            "Channel is still being checked"
+        });
+    }
+
+    if (
+      channel.live === false
+    ) {
+
+      return res
+        .status(503)
+        .json({
+
+          ok: false,
+
+          error:
+            "Channel is offline",
+
+          channel:
+            channel.name
         });
     }
 
@@ -1934,7 +1994,11 @@ app.post(
       return res
         .status(500)
         .json({
-          ok: false
+
+          ok: false,
+
+          error:
+            "Failed to start channel"
         });
     }
 
@@ -1968,9 +2032,22 @@ app.post(
     const ok =
       nextChannel();
 
+    if (!ok) {
+
+      return res
+        .status(503)
+        .json({
+
+          ok: false,
+
+          error:
+            "No live channel available"
+        });
+    }
+
     res.json({
 
-      ok,
+      ok: true,
 
       session:
         sessionId,
@@ -2005,7 +2082,7 @@ app.get(
         c => c.live === false
       ).length;
 
-    const unchecked =
+    const checkingCount =
       channels.filter(
         c => c.live === null
       ).length;
@@ -2094,8 +2171,8 @@ app.get(
         dead:
           deadCount,
 
-        unchecked:
-          unchecked,
+        checking:
+          checkingCount,
 
         current:
           currentIndex
@@ -2106,7 +2183,7 @@ app.get(
 
 
 // ============================================================
-// WEB
+// WEB UI
 // ============================================================
 
 app.get(
@@ -2176,8 +2253,7 @@ pre {
 
 <h2>IPTV</h2>
 
-<select id="channels">
-</select>
+<select id="channels"></select>
 
 <button onclick="playSelected()">
 Phát
@@ -2213,62 +2289,107 @@ Kênh tiếp
 
 let channels = [];
 
+
+// ==========================================================
+// LOAD CHANNELS
+// ==========================================================
+
 async function loadChannels() {
 
-  const response =
-    await fetch(
-      "/api/channels"
-    );
+  try {
 
-  channels =
-    await response.json();
-
-  const select =
-    document.getElementById(
-      "channels"
-    );
-
-  select.innerHTML = "";
-
-  channels.forEach(
-    (channel, index) => {
-
-      const option =
-        document.createElement(
-          "option"
-        );
-
-      option.value =
-        index;
-
-      let status = "";
-
-      if (
-        channel.live === true
-      ) {
-        status = " [LIVE]";
-      }
-
-      if (
-        channel.live === false
-      ) {
-        status = " [DEAD]";
-      }
-
-      option.textContent =
-        channel.name +
-        status;
-
-      select.appendChild(
-        option
+    const response =
+      await fetch(
+        "/api/channels?t=" +
+        Date.now()
       );
+
+    channels =
+      await response.json();
+
+    const select =
+      document.getElementById(
+        "channels"
+      );
+
+    const oldValue =
+      select.value;
+
+    select.innerHTML = "";
+
+    channels.forEach(
+      (channel, index) => {
+
+        const option =
+          document.createElement(
+            "option"
+          );
+
+        option.value =
+          index;
+
+        let status = "";
+
+        if (
+          channel.live === true
+        ) {
+
+          status =
+            " [LIVE]";
+        }
+
+        else if (
+          channel.live === false
+        ) {
+
+          status =
+            " [DEAD]";
+        }
+
+        else {
+
+          status =
+            " [CHECKING]";
+        }
+
+        option.textContent =
+          channel.name +
+          status;
+
+        // Không cho chọn dead/checking
+        option.disabled =
+          channel.live !== true;
+
+        select.appendChild(
+          option
+        );
+      }
+    );
+
+    // Giữ selection nếu còn tồn tại
+    const oldOption =
+      Array.from(
+        select.options
+      ).find(
+        o =>
+          o.value === oldValue &&
+          !o.disabled
+      );
+
+    if (oldOption) {
+      select.value =
+        oldValue;
     }
-  );
+
+  } catch (err) {
+
+    console.error(err);
+  }
 }
 
 
 // ==========================================================
-// PLAY SELECTED
+// PLAY
 // ==========================================================
 
 async function playSelected() {
@@ -2282,15 +2403,29 @@ async function playSelected() {
         .value
     );
 
-  await fetch(
-    "/api/channel/" +
-    index,
-    {
-      method: "POST"
-    }
-  );
+  const response =
+    await fetch(
+      "/api/channel/" +
+      index,
+      {
+        method: "POST"
+      }
+    );
 
-  // Chờ HLS session mới tạo playlist
+  const result =
+    await response.json();
+
+  if (!result.ok) {
+
+    alert(
+      result.error ||
+      "Không thể phát kênh"
+    );
+
+    return;
+  }
+
+  // Chờ HLS tạo playlist
   setTimeout(
     () => {
 
@@ -2322,12 +2457,26 @@ async function playSelected() {
 
 async function nextChannel() {
 
-  await fetch(
-    "/api/next",
-    {
-      method: "POST"
-    }
-  );
+  const response =
+    await fetch(
+      "/api/next",
+      {
+        method: "POST"
+      }
+    );
+
+  const result =
+    await response.json();
+
+  if (!result.ok) {
+
+    alert(
+      result.error ||
+      "Không có kênh LIVE"
+    );
+
+    return;
+  }
 
   setTimeout(
     () => {
@@ -2364,7 +2513,8 @@ async function updateStats() {
 
     const response =
       await fetch(
-        "/health"
+        "/health?t=" +
+        Date.now()
       );
 
     const data =
@@ -2380,12 +2530,11 @@ async function updateStats() {
       );
 
   } catch {}
-
 }
 
 
 // ==========================================================
-// REFRESH CHANNEL LIST
+// REFRESH
 // ==========================================================
 
 setInterval(
@@ -2400,6 +2549,8 @@ setInterval(
 
 loadChannels();
 
+updateStats();
+
 </script>
 
 </body>
@@ -2411,7 +2562,7 @@ loadChannels();
 
 
 // ============================================================
-// SERVER START
+// MAIN
 // ============================================================
 
 async function main() {
@@ -2435,7 +2586,7 @@ async function main() {
     }
 
     // --------------------------------------------------------
-    // SERVER START NGAY
+    // START SERVER
     // --------------------------------------------------------
 
     app.listen(
@@ -2444,6 +2595,10 @@ async function main() {
 
         log(
           `[SERVER] Running on port ${PORT}`
+        );
+
+        log(
+          `[SERVER] http://localhost:${PORT}/`
         );
 
         log(
@@ -2466,15 +2621,12 @@ async function main() {
 
     // --------------------------------------------------------
     // CHECK TẤT CẢ KÊNH
-    //
-    // 20 chỉ là concurrency.
-    // Không giới hạn playlist ở 20.
     // --------------------------------------------------------
 
     await checkAllChannels();
 
     // --------------------------------------------------------
-    // Tìm kênh LIVE đầu tiên
+    // CHỌN KÊNH LIVE ĐẦU TIÊN
     // --------------------------------------------------------
 
     const firstLive =

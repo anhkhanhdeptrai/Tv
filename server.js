@@ -732,7 +732,6 @@ app.get("/health", (req, res) => {
       lastError: stats.lastAudioError,
     },
   });
-}
 
 app.get("/api/status", (req, res) => {
   res.json({

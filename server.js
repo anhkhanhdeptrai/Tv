@@ -5,12 +5,11 @@ const path = require("path");
 const os = require("os");
 
 const app = express();
-
 const PORT = process.env.PORT || 10000;
 
-// ============================================================
+// ======================================================
 // CONFIG
-// ============================================================
+// ======================================================
 
 const PLAYLIST_URL =
   "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/vn.m3u";
@@ -19,30 +18,21 @@ const WIDTH = 320;
 const HEIGHT = 240;
 const FPS = 10;
 
-// Chỉ giữ vài frame gần nhất.
-// Không tích buffer lớn vì sẽ gây delay.
 const FRAME_BUFFER_SIZE = 3;
-
-// Audio buffer tối đa
 const MAX_AUDIO_BUFFER = 256 * 1024;
 
-// HLS
 const HLS_TIME = 2;
 const HLS_LIST = 6;
 
-// Số kênh check đồng thời
-const CHECK_CONCURRENCY = 20;
+const TMP_ROOT = path.join(os.tmpdir(), "iptv-server");
 
-// Timeout mỗi lần check
-const CHECK_TIMEOUT = 8000;
+fs.mkdirSync(TMP_ROOT, {
+  recursive: true
+});
 
-// Số lần thử mỗi channel
-const CHECK_RETRIES = 2;
-
-
-// ============================================================
+// ======================================================
 // GLOBAL
-// ============================================================
+// ======================================================
 
 let channels = [];
 
@@ -51,1719 +41,279 @@ let currentChannel = null;
 
 let sessionId = 0;
 
-let videoProcess = null;
-let hlsProcess = null;
-let audioProcess = null;
+let ffmpegVideo = null;
+let ffmpegHLS = null;
+let ffmpegAudio = null;
 
 let frameBuffer = [];
-
 let audioQueue = [];
-let audioBytes = 0;
 
-let currentHlsDir = null;
+let mjpegClients = new Set();
 
-const mjpegClients = new Set();
+let mjpegTimer = null;
+let statsTimer = null;
 
+let stats = {
+  ffmpegFrame: 0,
+  ffmpegFPS: 0,
+  ffmpegSpeed: 0,
 
-// ============================================================
-// STATS
-// ============================================================
+  mjpegFPS: 0,
+  mjpegTotalFrames: 0,
 
-const stats = {
+  bufferFrames: 0,
+  bufferSeconds: 0,
 
-  mjpeg: {
-    fps: 0,
-    frames: 0,
-    frame: 0,
-    speed: 0
-  },
-
-  hls: {
-    fps: 0,
-    frame: 0,
-    speed: 0
-  },
-
-  audio: {
-    running: false,
-    bytes: 0
-  }
+  audioBytes: 0
 };
 
-let fpsCounter = 0;
-let fpsLastTime = Date.now();
+let mjpegFrameCounter = 0;
+let lastMjpegStatTime = Date.now();
 
 
-// ============================================================
-// LOG
-// ============================================================
-
-function log(...args) {
-  console.log(
-    new Date().toISOString(),
-    ...args
-  );
-}
-
-
-// ============================================================
-// LOAD PLAYLIST
-// ============================================================
+// ======================================================
+// PLAYLIST
+// ======================================================
 
 async function loadPlaylist() {
+  console.log("==========================================");
+  console.log("LOAD IPTV PLAYLIST");
+  console.log("==========================================");
 
-  log("[M3U] Downloading playlist...");
-
-  const response =
-    await fetch(PLAYLIST_URL);
+  const response = await fetch(PLAYLIST_URL);
 
   if (!response.ok) {
     throw new Error(
-      `M3U HTTP ${response.status}`
+      `Cannot load playlist: HTTP ${response.status}`
     );
   }
 
-  const text =
-    await response.text();
+  const text = await response.text();
 
-  const lines =
-    text.split(/\r?\n/);
+  const lines = text.split(/\r?\n/);
 
-  const result = [];
+  channels = [];
 
-  let info = null;
+  let currentInfo = null;
 
-  for (const raw of lines) {
-
-    const line =
-      raw.trim();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
 
     if (!line) {
       continue;
     }
 
-    // --------------------------------------------------------
+    // ------------------------------------------
     // EXTINF
-    // --------------------------------------------------------
+    // ------------------------------------------
 
-    if (
-      line.startsWith("#EXTINF")
-    ) {
+    if (line.startsWith("#EXTINF:")) {
+      const comma = line.indexOf(",");
 
-      const comma =
-        line.indexOf(",");
+      let name = "";
 
-      const name =
-        comma >= 0
-          ? line.substring(comma + 1).trim()
-          : "Unknown";
+      if (comma !== -1) {
+        name = line.substring(comma + 1).trim();
+      }
 
-      const tvgId =
-        (
-          line.match(
-            /tvg-id="([^"]*)"/i
-          ) || []
-        )[1] || "";
+      const tvgIdMatch =
+        line.match(/tvg-id="([^"]*)"/i);
 
-      const group =
-        (
-          line.match(
-            /group-title="([^"]*)"/i
-          ) || []
-        )[1] || "";
+      const groupMatch =
+        line.match(/group-title="([^"]*)"/i);
 
-      const logo =
-        (
-          line.match(
-            /tvg-logo="([^"]*)"/i
-          ) || []
-        )[1] || "";
+      const logoMatch =
+        line.match(/tvg-logo="([^"]*)"/i);
 
-      info = {
-        name,
-        tvgId,
-        group,
-        logo
+      currentInfo = {
+        name: name || `Channel ${channels.length + 1}`,
+
+        tvgId:
+          tvgIdMatch ? tvgIdMatch[1] : "",
+
+        group:
+          groupMatch ? groupMatch[1] : "",
+
+        logo:
+          logoMatch ? logoMatch[1] : ""
       };
 
       continue;
     }
 
-    // --------------------------------------------------------
-    // URL
-    // --------------------------------------------------------
+    // ------------------------------------------
+    // STREAM URL
+    // ------------------------------------------
 
     if (
       !line.startsWith("#") &&
-      info
+      currentInfo
     ) {
+      channels.push({
+        index: channels.length,
 
-      result.push({
+        name: currentInfo.name,
 
-        ...info,
+        tvgId: currentInfo.tvgId,
+
+        group: currentInfo.group,
+
+        logo: currentInfo.logo,
 
         url: line,
 
-        // null = chưa check
-        // true = live
-        // false = dead
         live: null,
 
-        error: null,
-
-        checkAttempts: 0
-
-      });
-
-      info = null;
-    }
-  }
-
-  log(
-    `[M3U] Total channels: ${result.length}`
-  );
-
-  return result;
-}
-
-
-// ============================================================
-// CHECK ONE CHANNEL
-//
-// 8 giây / lần
-// thử tối đa 2 lần
-// ============================================================
-
-async function checkChannel(channel) {
-
-  let lastError = "unknown";
-
-  for (
-    let attempt = 1;
-    attempt <= CHECK_RETRIES;
-    attempt++
-  ) {
-
-    channel.checkAttempts =
-      attempt;
-
-    log(
-      `[CHECK] ${channel.name} - attempt ${attempt}/${CHECK_RETRIES}`
-    );
-
-    const result =
-      await new Promise(resolve => {
-
-        let finished = false;
-
-        let output = "";
-
-        let ff = null;
-
-        let timer = null;
-
-        function finish(
-          ok,
-          error = null
-        ) {
-
-          if (finished) {
-            return;
-          }
-
-          finished = true;
-
-          if (timer) {
-            clearTimeout(timer);
-          }
-
-          try {
-
-            if (ff) {
-              ff.kill("SIGKILL");
-            }
-
-          } catch {}
-
-          resolve({
-            ok,
-            error
-          });
-        }
-
-        try {
-
-          ff = spawn(
-            "ffprobe",
-            [
-              "-hide_banner",
-
-              "-loglevel",
-              "error",
-
-              // Không probe quá lâu
-              "-analyzeduration",
-              "1000000",
-
-              "-probesize",
-              "2M",
-
-              // 8 giây I/O timeout
-              "-rw_timeout",
-              "8000000",
-
-              "-i",
-              channel.url,
-
-              "-select_streams",
-              "v:0",
-
-              "-show_entries",
-              "stream=codec_type",
-
-              "-of",
-              "csv=p=0"
-            ],
-            {
-              stdio: [
-                "ignore",
-                "pipe",
-                "pipe"
-              ]
-            }
-          );
-
-          // --------------------------------------------------
-          // JS TIMEOUT
-          // --------------------------------------------------
-
-          timer =
-            setTimeout(
-              () => {
-
-                finish(
-                  false,
-                  "timeout"
-                );
-
-              },
-              CHECK_TIMEOUT
-            );
-
-          // --------------------------------------------------
-          // STDOUT
-          // --------------------------------------------------
-
-          ff.stdout.on(
-            "data",
-            data => {
-
-              if (finished) {
-                return;
-              }
-
-              output +=
-                data.toString();
-
-              if (
-                output
-                  .toLowerCase()
-                  .includes("video")
-              ) {
-
-                finish(
-                  true,
-                  null
-                );
-              }
-            }
-          );
-
-          // --------------------------------------------------
-          // STDERR
-          // --------------------------------------------------
-
-          ff.stderr.on(
-            "data",
-            data => {
-
-              if (finished) {
-                return;
-              }
-
-              const error =
-                data.toString().trim();
-
-              if (error) {
-                lastError =
-                  error.slice(
-                    0,
-                    300
-                  );
-              }
-            }
-          );
-
-          // --------------------------------------------------
-          // CLOSE
-          // --------------------------------------------------
-
-          ff.on(
-            "close",
-            code => {
-
-              if (finished) {
-                return;
-              }
-
-              const hasVideo =
-                output
-                  .toLowerCase()
-                  .includes("video");
-
-              if (
-                code === 0 &&
-                hasVideo
-              ) {
-
-                finish(
-                  true,
-                  null
-                );
-
-              } else {
-
-                finish(
-                  false,
-                  lastError ||
-                  `ffprobe exit ${code}`
-                );
-              }
-            }
-          );
-
-          // --------------------------------------------------
-          // ERROR
-          // --------------------------------------------------
-
-          ff.on(
-            "error",
-            err => {
-
-              finish(
-                false,
-                err.message
-              );
-            }
-          );
-
-        } catch (err) {
-
-          finish(
-            false,
-            err.message
-          );
-        }
-      });
-
-    if (result.ok) {
-
-      return {
-        ok: true,
         error: null
-      };
-    }
+      });
 
-    lastError =
-      result.error ||
-      "unknown";
-
-    // Nếu không phải lần cuối
-    // chờ 500ms rồi thử lại.
-    if (
-      attempt < CHECK_RETRIES
-    ) {
-
-      await new Promise(
-        resolve =>
-          setTimeout(
-            resolve,
-            500
-          )
-      );
+      currentInfo = null;
     }
   }
 
-  return {
-    ok: false,
-    error:
-      lastError ||
-      "timeout"
-  };
+  console.log(
+    `Loaded ${channels.length} channels`
+  );
+
+  console.log(
+    "NO CHANNEL CHECKING"
+  );
+
+  console.log("==========================================");
 }
 
 
-// ============================================================
-// CHECK ALL CHANNELS
-//
-// TẤT CẢ CHANNEL VẪN ĐƯỢC GIỮ.
-// ============================================================
-
-async function checkAllChannels() {
-
-  log(
-    `[CHECK] Checking ALL ${channels.length} channels`
-  );
-
-  log(
-    `[CHECK] Concurrency: ${CHECK_CONCURRENCY}`
-  );
-
-  let nextIndex = 0;
-
-  async function worker() {
-
-    while (true) {
-
-      const index =
-        nextIndex++;
-
-      if (
-        index >= channels.length
-      ) {
-        return;
-      }
-
-      const channel =
-        channels[index];
-
-      channel.live = null;
-      channel.error = null;
-
-      const result =
-        await checkChannel(
-          channel
-        );
-
-      channel.live =
-        result.ok;
-
-      channel.error =
-        result.ok
-          ? null
-          : result.error;
-
-      if (result.ok) {
-
-        log(
-          `[LIVE] ${index} ${channel.name}`
-        );
-
-      } else {
-
-        log(
-          `[DEAD] ${index} ${channel.name} -> ${result.error}`
-        );
-      }
-    }
-  }
-
-  const workers = [];
-
-  const workerCount =
-    Math.min(
-      CHECK_CONCURRENCY,
-      channels.length
-    );
-
-  for (
-    let i = 0;
-    i < workerCount;
-    i++
-  ) {
-
-    workers.push(
-      worker()
-    );
-  }
-
-  await Promise.all(
-    workers
-  );
-
-  const liveCount =
-    channels.filter(
-      c => c.live === true
-    ).length;
-
-  const deadCount =
-    channels.filter(
-      c => c.live === false
-    ).length;
-
-  log(
-    "=========================================="
-  );
-
-  log(
-    `[CHECK] Finished`
-  );
-
-  log(
-    `[CHECK] Total  : ${channels.length}`
-  );
-
-  log(
-    `[CHECK] Live   : ${liveCount}`
-  );
-
-  log(
-    `[CHECK] Dead   : ${deadCount}`
-  );
-
-  log(
-    "=========================================="
-  );
-}
-
-
-// ============================================================
-// HLS DIRECTORY
-// ============================================================
-
-function createHlsDirectory(id) {
-
-  const dir =
-    path.join(
-      os.tmpdir(),
-      `iptv-hls-${id}`
-    );
-
-  fs.mkdirSync(
-    dir,
-    {
-      recursive: true
-    }
-  );
-
-  return dir;
-}
-
-
-function removeHlsDirectory(dir) {
-
-  if (!dir) {
-    return;
-  }
-
-  try {
-
-    fs.rmSync(
-      dir,
-      {
-        recursive: true,
-        force: true
-      }
-    );
-
-  } catch {}
-}
-
-
-// ============================================================
-// KILL PROCESS
-// ============================================================
+// ======================================================
+// CLEANUP OLD SESSION
+// ======================================================
 
 function killProcess(proc) {
-
   if (!proc) {
     return;
   }
 
   try {
     proc.kill("SIGKILL");
-  } catch {}
+  } catch (_) {}
 }
 
 
-// ============================================================
-// STOP SESSION
-// ============================================================
+function clearClients() {
+  for (const client of mjpegClients) {
+    try {
+      client.end();
+    } catch (_) {}
+  }
+
+  mjpegClients.clear();
+}
+
 
 function stopCurrentSession() {
+  console.log("Stopping current session...");
 
-  log(
-    "[SESSION] Stopping old session"
-  );
-
-  killProcess(videoProcess);
-  killProcess(hlsProcess);
-  killProcess(audioProcess);
-
-  videoProcess = null;
-  hlsProcess = null;
-  audioProcess = null;
-
-  // Xóa frame cũ
-  frameBuffer = [];
-
-  // Xóa audio cũ
-  audioQueue = [];
-  audioBytes = 0;
-
-  stats.audio.running =
-    false;
-
-  stats.audio.bytes =
-    0;
-
-  // Xóa HLS cũ
-  if (currentHlsDir) {
-
-    removeHlsDirectory(
-      currentHlsDir
-    );
-
-    currentHlsDir = null;
-  }
-}
-
-
-// ============================================================
-// PARSE FFMPEG STATS
-// ============================================================
-
-function parseFFmpegStats(
-  text,
-  type
-) {
-
-  const fps =
-    text.match(
-      /fps=\s*([0-9.]+)/
-    );
-
-  const speed =
-    text.match(
-      /speed=\s*([0-9.]+)x/
-    );
-
-  const frame =
-    text.match(
-      /frame=\s*([0-9]+)/
-    );
-
-  if (
-    type === "video"
-  ) {
-
-    if (fps) {
-      stats.mjpeg.fps =
-        Number(
-          fps[1]
-        );
-    }
-
-    if (speed) {
-      stats.mjpeg.speed =
-        Number(
-          speed[1]
-        );
-    }
-
-    if (frame) {
-      stats.mjpeg.frame =
-        Number(
-          frame[1]
-        );
-    }
-  }
-
-  if (
-    type === "hls"
-  ) {
-
-    if (fps) {
-      stats.hls.fps =
-        Number(
-          fps[1]
-        );
-    }
-
-    if (speed) {
-      stats.hls.speed =
-        Number(
-          speed[1]
-        );
-    }
-
-    if (frame) {
-      stats.hls.frame =
-        Number(
-          frame[1]
-        );
-    }
-  }
-}
-
-
-// ============================================================
-// FPS
-// ============================================================
-
-function updateFPS() {
-
-  fpsCounter++;
-
-  const now =
-    Date.now();
-
-  const elapsed =
-    now -
-    fpsLastTime;
-
-  if (
-    elapsed >= 1000
-  ) {
-
-    stats.mjpeg.fps =
-      fpsCounter /
-      (elapsed / 1000);
-
-    fpsCounter = 0;
-
-    fpsLastTime =
-      now;
-  }
-}
-
-
-// ============================================================
-// START VIDEO / MJPEG
-// ============================================================
-
-function startVideo(
-  channel,
-  mySession
-) {
-
-  log(
-    `[VIDEO] Session ${mySession}: ${channel.name}`
-  );
-
-  frameBuffer = [];
-
-  fpsCounter = 0;
-  fpsLastTime =
-    Date.now();
-
-  const ff =
-    spawn(
-      "ffmpeg",
-      [
-        "-hide_banner",
-
-        "-loglevel",
-        "warning",
-
-        // LOW LATENCY
-        "-fflags",
-        "nobuffer",
-
-        "-flags",
-        "low_delay",
-
-        "-avioflags",
-        "direct",
-
-        "-analyzeduration",
-        "500k",
-
-        "-probesize",
-        "1M",
-
-        "-rw_timeout",
-        "5000000",
-
-        "-i",
-        channel.url,
-
-        "-map",
-        "0:v:0",
-
-        "-an",
-
-        // ----------------------------------------------------
-        // Decode realtime
-        // ----------------------------------------------------
-
-        "-vf",
-        [
-          `fps=${FPS}`,
-
-          `scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear:force_original_aspect_ratio=decrease`,
-
-          `pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`
-        ].join(","),
-
-        "-c:v",
-        "mjpeg",
-
-        "-q:v",
-        "18",
-
-        "-fps_mode",
-        "cfr",
-
-        "-flush_packets",
-        "1",
-
-        "-f",
-        "image2pipe",
-
-        "pipe:1"
-      ],
-      {
-        stdio: [
-          "ignore",
-          "pipe",
-          "pipe"
-        ]
-      }
-    );
-
-  videoProcess =
-    ff;
-
-  let buffer =
-    Buffer.alloc(0);
-
-  // ----------------------------------------------------------
-  // JPEG PARSER
-  // ----------------------------------------------------------
-
-  ff.stdout.on(
-    "data",
-    chunk => {
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      buffer =
-        Buffer.concat([
-          buffer,
-          chunk
-        ]);
-
-      while (true) {
-
-        const start =
-          buffer.indexOf(
-            Buffer.from([
-              0xff,
-              0xd8
-            ])
-          );
-
-        if (
-          start < 0
-        ) {
-
-          if (
-            buffer.length >
-            512 * 1024
-          ) {
-
-            buffer =
-              buffer.slice(
-                -32 * 1024
-              );
-          }
-
-          break;
-        }
-
-        const end =
-          buffer.indexOf(
-            Buffer.from([
-              0xff,
-              0xd9
-            ]),
-            start + 2
-          );
-
-        if (
-          end < 0
-        ) {
-
-          if (
-            start > 0
-          ) {
-
-            buffer =
-              buffer.slice(
-                start
-              );
-          }
-
-          break;
-        }
-
-        const endPos =
-          end + 2;
-
-        const jpeg =
-          Buffer.from(
-            buffer.slice(
-              start,
-              endPos
-            )
-          );
-
-        buffer =
-          buffer.slice(
-            endPos
-          );
-
-        if (
-          mySession !== sessionId
-        ) {
-          return;
-        }
-
-        // ----------------------------------------------------
-        // CHỈ GIỮ FRAME MỚI
-        // ----------------------------------------------------
-
-        frameBuffer.push({
-          data: jpeg,
-          time: Date.now()
-        });
-
-        while (
-          frameBuffer.length >
-          FRAME_BUFFER_SIZE
-        ) {
-
-          frameBuffer.shift();
-        }
-
-        stats.mjpeg.frames++;
-
-        updateFPS();
-      }
-    }
-  );
-
-  // ----------------------------------------------------------
-  // FFMPEG STDERR
-  // ----------------------------------------------------------
-
-  ff.stderr.on(
-    "data",
-    data => {
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      parseFFmpegStats(
-        data.toString(),
-        "video"
-      );
-    }
-  );
-
-  // ----------------------------------------------------------
-  // CLOSE
-  // ----------------------------------------------------------
-
-  ff.on(
-    "close",
-    code => {
-
-      log(
-        `[VIDEO] Session ${mySession} stopped: ${code}`
-      );
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      if (
-        videoProcess === ff
-      ) {
-
-        videoProcess =
-          null;
-      }
-
-      if (
-        currentChannel &&
-        mySession === sessionId
-      ) {
-
-        setTimeout(
-          () => {
-
-            if (
-              currentChannel &&
-              mySession === sessionId
-            ) {
-
-              startVideo(
-                currentChannel,
-                mySession
-              );
-            }
-
-          },
-          1000
-        );
-      }
-    }
-  );
-
-  ff.on(
-    "error",
-    err => {
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      log(
-        `[VIDEO] Error: ${err.message}`
-      );
-    }
-  );
-}
-
-
-// ============================================================
-// START HLS
-// ============================================================
-
-function startHLS(
-  channel,
-  mySession,
-  hlsDir
-) {
-
-  log(
-    `[HLS] Session ${mySession}: ${channel.name}`
-  );
-
-  const playlist =
-    path.join(
-      hlsDir,
-      "index.m3u8"
-    );
-
-  const segment =
-    path.join(
-      hlsDir,
-      "segment-%05d.ts"
-    );
-
-  const ff =
-    spawn(
-      "ffmpeg",
-      [
-        "-hide_banner",
-
-        "-loglevel",
-        "warning",
-
-        "-fflags",
-        "nobuffer",
-
-        "-flags",
-        "low_delay",
-
-        "-reconnect",
-        "1",
-
-        "-reconnect_streamed",
-        "1",
-
-        "-reconnect_delay_max",
-        "2",
-
-        "-rw_timeout",
-        "5000000",
-
-        "-i",
-        channel.url,
-
-        // VIDEO
-        "-map",
-        "0:v:0",
-
-        "-c:v",
-        "copy",
-
-        // AUDIO
-        "-map",
-        "0:a:0?",
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "96k",
-
-        "-ac",
-        "2",
-
-        "-f",
-        "hls",
-
-        "-hls_time",
-        String(HLS_TIME),
-
-        "-hls_list_size",
-        String(HLS_LIST),
-
-        "-hls_flags",
-        "delete_segments+append_list+omit_endlist",
-
-        "-hls_segment_filename",
-        segment,
-
-        playlist
-      ],
-      {
-        stdio: [
-          "ignore",
-          "ignore",
-          "pipe"
-        ]
-      }
-    );
-
-  hlsProcess =
-    ff;
-
-  ff.stderr.on(
-    "data",
-    data => {
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      parseFFmpegStats(
-        data.toString(),
-        "hls"
-      );
-    }
-  );
-
-  ff.on(
-    "close",
-    code => {
-
-      log(
-        `[HLS] Session ${mySession} stopped: ${code}`
-      );
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      if (
-        hlsProcess === ff
-      ) {
-
-        hlsProcess =
-          null;
-      }
-
-      if (
-        currentChannel &&
-        mySession === sessionId
-      ) {
-
-        setTimeout(
-          () => {
-
-            if (
-              currentChannel &&
-              mySession === sessionId
-            ) {
-
-              startHLS(
-                currentChannel,
-                mySession,
-                hlsDir
-              );
-            }
-
-          },
-          1000
-        );
-      }
-    }
-  );
-
-  ff.on(
-    "error",
-    err => {
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      log(
-        `[HLS] Error: ${err.message}`
-      );
-    }
-  );
-}
-
-
-// ============================================================
-// AUDIO
-// ============================================================
-
-function startAudio(
-  channel,
-  mySession
-) {
-
-  log(
-    `[AUDIO] Session ${mySession}: ${channel.name}`
-  );
-
-  audioQueue = [];
-  audioBytes = 0;
-
-  stats.audio.bytes =
-    0;
-
-  const ff =
-    spawn(
-      "ffmpeg",
-      [
-        "-hide_banner",
-
-        "-loglevel",
-        "warning",
-
-        "-reconnect",
-        "1",
-
-        "-reconnect_streamed",
-        "1",
-
-        "-reconnect_delay_max",
-        "5",
-
-        "-fflags",
-        "nobuffer",
-
-        "-rw_timeout",
-        "5000000",
-
-        "-i",
-        channel.url,
-
-        "-vn",
-
-        "-ac",
-        "1",
-
-        "-ar",
-        "44100",
-
-        "-c:a",
-        "pcm_s16le",
-
-        "-f",
-        "s16le",
-
-        "pipe:1"
-      ],
-      {
-        stdio: [
-          "ignore",
-          "pipe",
-          "pipe"
-        ]
-      }
-    );
-
-  audioProcess =
-    ff;
-
-  stats.audio.running =
-    true;
-
-  ff.stdout.on(
-    "data",
-    chunk => {
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      const data =
-        Buffer.from(chunk);
-
-      audioQueue.push(
-        data
-      );
-
-      audioBytes +=
-        data.length;
-
-      // Không để audio buffer tăng vô hạn
-      while (
-        audioBytes >
-        MAX_AUDIO_BUFFER
-      ) {
-
-        const old =
-          audioQueue.shift();
-
-        if (!old) {
-          break;
-        }
-
-        audioBytes -=
-          old.length;
-      }
-
-      stats.audio.bytes =
-        audioBytes;
-    }
-  );
-
-  ff.on(
-    "close",
-    code => {
-
-      log(
-        `[AUDIO] Session ${mySession} stopped: ${code}`
-      );
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      stats.audio.running =
-        false;
-
-      if (
-        audioProcess === ff
-      ) {
-
-        audioProcess =
-          null;
-      }
-
-      if (
-        currentChannel &&
-        mySession === sessionId
-      ) {
-
-        setTimeout(
-          () => {
-
-            if (
-              currentChannel &&
-              mySession === sessionId
-            ) {
-
-              startAudio(
-                currentChannel,
-                mySession
-              );
-            }
-
-          },
-          1000
-        );
-      }
-    }
-  );
-
-  ff.on(
-    "error",
-    err => {
-
-      if (
-        mySession !== sessionId
-      ) {
-        return;
-      }
-
-      log(
-        `[AUDIO] Error: ${err.message}`
-      );
-    }
-  );
-}
-
-
-// ============================================================
-// START CHANNEL
-// ============================================================
-
-function startChannel(index) {
-
-  if (
-    index < 0 ||
-    index >= channels.length
-  ) {
-    return false;
-  }
-
-  const channel =
-    channels[index];
-
-  // Không phát channel đã xác định dead
-  if (
-    channel.live === false
-  ) {
-
-    log(
-      `[CHANNEL] DEAD: ${channel.name}`
-    );
-
-    return false;
-  }
-
-  // Session mới
   sessionId++;
 
-  const mySession =
-    sessionId;
+  killProcess(ffmpegVideo);
+  killProcess(ffmpegHLS);
+  killProcess(ffmpegAudio);
 
-  // Dừng session cũ
-  stopCurrentSession();
+  ffmpegVideo = null;
+  ffmpegHLS = null;
+  ffmpegAudio = null;
 
-  currentIndex =
-    index;
+  frameBuffer = [];
+  audioQueue = [];
 
-  currentChannel =
-    channel;
+  clearClients();
 
-  log(
-    "================================================"
-  );
+  if (mjpegTimer) {
+    clearInterval(mjpegTimer);
+    mjpegTimer = null;
+  }
 
-  log(
-    `[SESSION] ${mySession}`
-  );
+  if (statsTimer) {
+    clearInterval(statsTimer);
+    statsTimer = null;
+  }
 
-  log(
-    `[CHANNEL] ${channel.name}`
-  );
+  stats = {
+    ffmpegFrame: 0,
+    ffmpegFPS: 0,
+    ffmpegSpeed: 0,
 
-  log(
-    `[URL] ${channel.url}`
-  );
+    mjpegFPS: 0,
+    mjpegTotalFrames: 0,
 
-  log(
-    "================================================"
-  );
+    bufferFrames: 0,
+    bufferSeconds: 0,
 
-  // HLS riêng cho session
-  currentHlsDir =
-    createHlsDirectory(
-      mySession
-    );
+    audioBytes: 0
+  };
 
-  // Video
-  startVideo(
-    channel,
-    mySession
-  );
-
-  // HLS + AUDIO
-  startHLS(
-    channel,
-    mySession,
-    currentHlsDir
-  );
-
-  // PCM audio
-  startAudio(
-    channel,
-    mySession
-  );
-
-  return true;
+  mjpegFrameCounter = 0;
+  lastMjpegStatTime = Date.now();
 }
 
 
-// ============================================================
-// NEXT LIVE
-// ============================================================
+// ======================================================
+// NEW HLS DIRECTORY
+// ======================================================
 
-function nextChannel() {
+function createHLSDirectory(mySession) {
+  const dir = path.join(
+    TMP_ROOT,
+    `hls-${mySession}`
+  );
 
-  if (
-    !channels.length
-  ) {
-    return false;
-  }
+  fs.rmSync(dir, {
+    recursive: true,
+    force: true
+  });
 
-  for (
-    let step = 1;
-    step <= channels.length;
-    step++
-  ) {
+  fs.mkdirSync(dir, {
+    recursive: true
+  });
 
-    const index =
-      (
-        currentIndex +
-        step
-      ) %
-      channels.length;
-
-    if (
-      channels[index].live === true
-    ) {
-
-      return startChannel(
-        index
-      );
-    }
-  }
-
-  return false;
+  return dir;
 }
 
 
-// ============================================================
-// MJPEG STREAM
-// ============================================================
+// ======================================================
+// MJPEG BROADCAST
+// ======================================================
 
-app.get(
-  "/stream",
-  (req, res) => {
-
-    res.writeHead(
-      200,
-      {
-        "Content-Type":
-          "multipart/x-mixed-replace; boundary=frame",
-
-        "Cache-Control":
-          "no-cache, no-store, must-revalidate",
-
-        "Pragma":
-          "no-cache",
-
-        "Connection":
-          "keep-alive",
-
-        "Access-Control-Allow-Origin":
-          "*"
-      }
-    );
-
-    const client = {
-
-      res,
-
-      session:
-        sessionId,
-
-      lastFrame:
-        null
-    };
-
-    mjpegClients.add(
-      client
-    );
-
-    req.on(
-      "close",
-      () => {
-
-        mjpegClients.delete(
-          client
-        );
-      }
-    );
+function startMJPEGBroadcaster(mySession) {
+  if (mjpegTimer) {
+    clearInterval(mjpegTimer);
   }
-);
 
+  mjpegTimer = setInterval(() => {
 
-// ============================================================
-// MJPEG BROADCASTER
-//
-// FFmpeg -> buffer nhỏ -> broadcaster -> client
-//
-// Không gửi frame trực tiếp từ stdout.
-// ============================================================
-
-setInterval(
-  () => {
-
-    if (
-      frameBuffer.length === 0
-    ) {
+    if (mySession !== sessionId) {
       return;
     }
 
-    // LUÔN LẤY FRAME MỚI NHẤT
+    if (frameBuffer.length === 0) {
+      return;
+    }
+
+    // ------------------------------------------
+    // CHỈ LẤY FRAME MỚI NHẤT
+    // Không phát frame cũ.
+    // ------------------------------------------
+
     const frame =
-      frameBuffer[
-        frameBuffer.length - 1
-      ];
+      frameBuffer[frameBuffer.length - 1];
 
-    for (
-      const client of mjpegClients
-    ) {
+    // Xóa các frame cũ
+    frameBuffer = [frame];
 
-      // Session cũ
-      if (
-        client.session !== sessionId
-      ) {
+    const clients =
+      Array.from(mjpegClients);
 
-        client.session =
-          sessionId;
-
-        client.lastFrame =
-          null;
-
-        continue;
-      }
-
-      // Không gửi cùng frame 2 lần
-      if (
-        client.lastFrame ===
-        frame.time
-      ) {
-        continue;
-      }
-
+    for (const client of clients) {
       try {
-
         client.res.write(
           "--frame\r\n"
         );
@@ -1778,533 +328,782 @@ setInterval(
           "\r\n\r\n"
         );
 
-        client.res.write(
-          frame.data
-        );
+        client.res.write(frame.data);
 
-        client.res.write(
-          "\r\n"
-        );
+        client.res.write("\r\n");
 
-        client.lastFrame =
-          frame.time;
+      } catch (_) {
 
-      } catch {
+        try {
+          client.res.end();
+        } catch (_) {}
 
-        mjpegClients.delete(
-          client
-        );
+        mjpegClients.delete(client);
       }
     }
 
-  },
-  Math.round(
-    1000 / FPS
-  )
-);
+    stats.mjpegTotalFrames++;
 
+    mjpegFrameCounter++;
 
-// ============================================================
-// HLS PLAYLIST
-// ============================================================
-
-app.get(
-  "/hls/index.m3u8",
-  (req, res) => {
+    const now = Date.now();
 
     if (
-      !currentHlsDir
+      now - lastMjpegStatTime >= 1000
     ) {
+      stats.mjpegFPS =
+        mjpegFrameCounter /
+        ((now - lastMjpegStatTime) / 1000);
 
-      return res
-        .status(503)
-        .send(
-          "HLS not ready"
-        );
+      mjpegFrameCounter = 0;
+
+      lastMjpegStatTime = now;
     }
 
-    const file =
-      path.join(
-        currentHlsDir,
-        "index.m3u8"
-      );
+    stats.bufferFrames =
+      frameBuffer.length;
 
-    if (
-      !fs.existsSync(file)
-    ) {
+    stats.bufferSeconds =
+      frameBuffer.length / FPS;
 
-      return res
-        .status(503)
-        .send(
-          "HLS not ready"
-        );
+  }, 1000 / FPS);
+}
+
+
+// ======================================================
+// VIDEO -> MJPEG
+// ======================================================
+
+function startVideo(channel, mySession) {
+
+  console.log("");
+  console.log("==========================================");
+  console.log("START MJPEG");
+  console.log("Channel:", channel.name);
+  console.log("URL:", channel.url);
+  console.log("==========================================");
+
+  const args = [
+    "-hide_banner",
+
+    "-loglevel",
+    "warning",
+
+    // ----------------------------------------
+    // LOW LATENCY
+    // ----------------------------------------
+
+    "-fflags",
+    "nobuffer",
+
+    "-flags",
+    "low_delay",
+
+    "-avioflags",
+    "direct",
+
+    "-analyzeduration",
+    "500k",
+
+    "-probesize",
+    "1M",
+
+    "-rw_timeout",
+    "5000000",
+
+    // ----------------------------------------
+    // INPUT
+    // ----------------------------------------
+
+    "-i",
+    channel.url,
+
+    // ----------------------------------------
+    // VIDEO ONLY
+    // ----------------------------------------
+
+    "-map",
+    "0:v:0",
+
+    "-an",
+
+    // ----------------------------------------
+    // 320x240 / 10 FPS
+    // ----------------------------------------
+
+    "-vf",
+    [
+      `fps=${FPS}`,
+
+      `scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear:force_original_aspect_ratio=decrease`,
+
+      `pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`
+    ].join(","),
+
+    // ----------------------------------------
+    // MJPEG
+    // ----------------------------------------
+
+    "-c:v",
+    "mjpeg",
+
+    "-q:v",
+    "18",
+
+    "-fps_mode",
+    "cfr",
+
+    "-flush_packets",
+    "1",
+
+    "-f",
+    "image2pipe",
+
+    "pipe:1"
+  ];
+
+  ffmpegVideo = spawn(
+    "ffmpeg",
+    args,
+    {
+      stdio: [
+        "ignore",
+        "pipe",
+        "pipe"
+      ]
     }
+  );
 
-    try {
+  let jpegBuffer = Buffer.alloc(0);
 
-      let data =
-        fs.readFileSync(
-          file,
-          "utf8"
-        );
+  ffmpegVideo.stdout.on(
+    "data",
+    (chunk) => {
 
-      // Rewrite segment URL
-      data =
-        data.replace(
-          /^([^#\r\n]+\.ts)$/gm,
-          "/hls-segment/$1"
-        );
+      if (mySession !== sessionId) {
+        return;
+      }
 
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.apple.mpegurl"
-      );
+      jpegBuffer = Buffer.concat([
+        jpegBuffer,
+        chunk
+      ]);
 
-      res.setHeader(
-        "Cache-Control",
-        "no-cache, no-store"
-      );
+      while (true) {
 
-      res.send(
-        data
-      );
+        const start =
+          jpegBuffer.indexOf(
+            Buffer.from([0xff, 0xd8])
+          );
 
-    } catch {
+        if (start === -1) {
 
-      res
-        .status(500)
-        .send(
-          "HLS read error"
-        );
-    }
-  }
-);
+          // Không để buffer phình
+          if (jpegBuffer.length > 1024 * 1024) {
+            jpegBuffer =
+              jpegBuffer.subarray(
+                jpegBuffer.length - 64 * 1024
+              );
+          }
 
-
-// ============================================================
-// HLS SEGMENT
-// ============================================================
-
-app.get(
-  "/hls-segment/:file",
-  (req, res) => {
-
-    if (
-      !currentHlsDir
-    ) {
-
-      return res
-        .status(404)
-        .send(
-          "No HLS"
-        );
-    }
-
-    const filename =
-      path.basename(
-        req.params.file
-      );
-
-    const file =
-      path.join(
-        currentHlsDir,
-        filename
-      );
-
-    if (
-      !fs.existsSync(file)
-    ) {
-
-      return res
-        .status(404)
-        .send(
-          "Segment not found"
-        );
-    }
-
-    res.setHeader(
-      "Content-Type",
-      "video/mp2t"
-    );
-
-    res.setHeader(
-      "Cache-Control",
-      "no-cache, no-store"
-    );
-
-    fs.createReadStream(
-      file
-    ).pipe(res);
-  }
-);
-
-
-// ============================================================
-// API CHANNELS
-//
-// TẤT CẢ CHANNEL ĐỀU TRẢ VỀ
-// ============================================================
-
-app.get(
-  "/api/channels",
-  (req, res) => {
-
-    res.json(
-      channels.map(
-        (channel, index) => ({
-
-          index,
-
-          name:
-            channel.name,
-
-          group:
-            channel.group,
-
-          logo:
-            channel.logo,
-
-          tvgId:
-            channel.tvgId,
-
-          url:
-            channel.url,
-
-          live:
-            channel.live,
-
-          error:
-            channel.error,
-
-          checkAttempts:
-            channel.checkAttempts,
-
-          status:
-            channel.live === true
-              ? "live"
-              : channel.live === false
-                ? "dead"
-                : "checking"
-
-        })
-      )
-    );
-  }
-);
-
-
-// ============================================================
-// CURRENT
-// ============================================================
-
-app.get(
-  "/api/current",
-  (req, res) => {
-
-    res.json({
-
-      session:
-        sessionId,
-
-      index:
-        currentIndex,
-
-      channel:
-        currentChannel
-          ? {
-              name:
-                currentChannel.name,
-
-              url:
-                currentChannel.url,
-
-              live:
-                currentChannel.live
-            }
-          : null
-    });
-  }
-);
-
-
-// ============================================================
-// SELECT CHANNEL
-// ============================================================
-
-app.post(
-  "/api/channel/:index",
-  (req, res) => {
-
-    const index =
-      Number(
-        req.params.index
-      );
-
-    if (
-      !Number.isInteger(index) ||
-      index < 0 ||
-      index >= channels.length
-    ) {
-
-      return res
-        .status(400)
-        .json({
-
-          ok: false,
-
-          error:
-            "Invalid channel"
-        });
-    }
-
-    const channel =
-      channels[index];
-
-    if (
-      channel.live === null
-    ) {
-
-      return res
-        .status(409)
-        .json({
-
-          ok: false,
-
-          error:
-            "Channel is still checking"
-        });
-    }
-
-    if (
-      channel.live === false
-    ) {
-
-      return res
-        .status(503)
-        .json({
-
-          ok: false,
-
-          error:
-            "Channel is offline",
-
-          channel:
-            channel.name
-        });
-    }
-
-    const ok =
-      startChannel(
-        index
-      );
-
-    if (!ok) {
-
-      return res
-        .status(500)
-        .json({
-
-          ok: false,
-
-          error:
-            "Failed to start channel"
-        });
-    }
-
-    res.json({
-
-      ok: true,
-
-      session:
-        sessionId,
-
-      index,
-
-      channel:
-        currentChannel.name
-    });
-  }
-);
-
-
-// ============================================================
-// NEXT
-// ============================================================
-
-app.post(
-  "/api/next",
-  (req, res) => {
-
-    const ok =
-      nextChannel();
-
-    if (!ok) {
-
-      return res
-        .status(503)
-        .json({
-
-          ok: false,
-
-          error:
-            "No live channel available"
-        });
-    }
-
-    res.json({
-
-      ok: true,
-
-      session:
-        sessionId,
-
-      index:
-        currentIndex,
-
-      channel:
-        currentChannel
-          ? currentChannel.name
-          : null
-    });
-  }
-);
-
-
-// ============================================================
-// HEALTH
-// ============================================================
-
-app.get(
-  "/health",
-  (req, res) => {
-
-    const liveCount =
-      channels.filter(
-        c => c.live === true
-      ).length;
-
-    const deadCount =
-      channels.filter(
-        c => c.live === false
-      ).length;
-
-    const checkingCount =
-      channels.filter(
-        c => c.live === null
-      ).length;
-
-    res.json({
-
-      ok: true,
-
-      session:
-        sessionId,
-
-      channel:
-        currentChannel
-          ? currentChannel.name
-          : null,
-
-      index:
-        currentIndex,
-
-      resolution:
-        `${WIDTH}x${HEIGHT}`,
-
-      targetFPS:
-        FPS,
-
-      check: {
-
-        timeout:
-          CHECK_TIMEOUT,
-
-        retries:
-          CHECK_RETRIES,
-
-        concurrency:
-          CHECK_CONCURRENCY
-      },
-
-      stats: {
-
-        mjpeg: {
-
-          fps:
-            stats.mjpeg.fps,
-
-          totalFrames:
-            stats.mjpeg.frames,
-
-          frame:
-            stats.mjpeg.frame,
-
-          speed:
-            stats.mjpeg.speed,
-
-          bufferFrames:
-            frameBuffer.length,
-
-          bufferSeconds:
-            frameBuffer.length /
-            FPS
-        },
-
-        hls: {
-
-          fps:
-            stats.hls.fps,
-
-          frame:
-            stats.hls.frame,
-
-          speed:
-            stats.hls.speed
-        },
-
-        audio: {
-
-          running:
-            stats.audio.running,
-
-          bytes:
-            stats.audio.bytes
+          break;
         }
-      },
 
-      channels: {
+        const end =
+          jpegBuffer.indexOf(
+            Buffer.from([0xff, 0xd9]),
+            start + 2
+          );
 
-        total:
-          channels.length,
+        if (end === -1) {
+          break;
+        }
 
-        live:
-          liveCount,
+        const jpegEnd = end + 2;
 
-        dead:
-          deadCount,
+        const frame =
+          jpegBuffer.subarray(
+            start,
+            jpegEnd
+          );
 
-        checking:
-          checkingCount,
+        jpegBuffer =
+          jpegBuffer.subarray(jpegEnd);
 
-        current:
-          currentIndex
+        // ------------------------------------
+        // BUFFER CỰC NHỎ
+        // ------------------------------------
+
+        frameBuffer.push({
+          data: Buffer.from(frame),
+          time: Date.now()
+        });
+
+        while (
+          frameBuffer.length >
+          FRAME_BUFFER_SIZE
+        ) {
+          frameBuffer.shift();
+        }
+
+        stats.bufferFrames =
+          frameBuffer.length;
       }
-    });
+    }
+  );
+
+
+  ffmpegVideo.stderr.on(
+    "data",
+    (data) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      const text =
+        data.toString();
+
+      const fpsMatch =
+        text.match(
+          /fps=\s*([0-9.]+)/
+        );
+
+      const speedMatch =
+        text.match(
+          /speed=\s*([0-9.]+)x/
+        );
+
+      const frameMatch =
+        text.match(
+          /frame=\s*(\d+)/
+        );
+
+      if (fpsMatch) {
+        stats.ffmpegFPS =
+          Number(fpsMatch[1]);
+      }
+
+      if (speedMatch) {
+        stats.ffmpegSpeed =
+          Number(speedMatch[1]);
+      }
+
+      if (frameMatch) {
+        stats.ffmpegFrame =
+          Number(frameMatch[1]);
+      }
+
+      const clean =
+        text.trim();
+
+      if (clean) {
+        console.log(
+          "[FFMPEG VIDEO]",
+          clean
+        );
+      }
+    }
+  );
+
+
+  ffmpegVideo.on(
+    "close",
+    (code, signal) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      console.log(
+        "FFmpeg MJPEG stopped:",
+        code,
+        signal
+      );
+
+      ffmpegVideo = null;
+    }
+  );
+
+
+  ffmpegVideo.on(
+    "error",
+    (err) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      console.error(
+        "FFmpeg MJPEG error:",
+        err.message
+      );
+    }
+  );
+
+
+  startMJPEGBroadcaster(
+    mySession
+  );
+}
+
+
+// ======================================================
+// HLS
+// ======================================================
+
+function startHLS(channel, mySession) {
+
+  const hlsDir =
+    createHLSDirectory(mySession);
+
+  const playlist =
+    path.join(
+      hlsDir,
+      "index.m3u8"
+    );
+
+  const segment =
+    path.join(
+      hlsDir,
+      "segment-%05d.ts"
+    );
+
+  console.log("");
+  console.log("==========================================");
+  console.log("START HLS");
+  console.log("Channel:", channel.name);
+  console.log("==========================================");
+
+  const args = [
+
+    "-hide_banner",
+
+    "-loglevel",
+    "warning",
+
+    // ----------------------------------------
+    // LOW LATENCY
+    // ----------------------------------------
+
+    "-fflags",
+    "nobuffer",
+
+    "-flags",
+    "low_delay",
+
+    "-avioflags",
+    "direct",
+
+    "-reconnect",
+    "1",
+
+    "-reconnect_streamed",
+    "1",
+
+    "-reconnect_delay_max",
+    "2",
+
+    "-rw_timeout",
+    "5000000",
+
+    // ----------------------------------------
+    // INPUT
+    // ----------------------------------------
+
+    "-i",
+    channel.url,
+
+    // ----------------------------------------
+    // VIDEO
+    // KHÔNG ENCODE LẠI
+    // ----------------------------------------
+
+    "-map",
+    "0:v:0",
+
+    "-c:v",
+    "copy",
+
+    // ----------------------------------------
+    // AUDIO
+    // ----------------------------------------
+
+    "-map",
+    "0:a:0?",
+
+    "-c:a",
+    "aac",
+
+    "-b:a",
+    "128k",
+
+    "-ar",
+    "44100",
+
+    "-ac",
+    "2",
+
+    // ----------------------------------------
+    // HLS
+    // ----------------------------------------
+
+    "-f",
+    "hls",
+
+    "-hls_time",
+    String(HLS_TIME),
+
+    "-hls_list_size",
+    String(HLS_LIST),
+
+    "-hls_flags",
+    "delete_segments+append_list+omit_endlist",
+
+    "-hls_segment_filename",
+    segment,
+
+    playlist
+  ];
+
+  ffmpegHLS = spawn(
+    "ffmpeg",
+    args,
+    {
+      stdio: [
+        "ignore",
+        "ignore",
+        "pipe"
+      ]
+    }
+  );
+
+
+  ffmpegHLS.stderr.on(
+    "data",
+    (data) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      const text =
+        data.toString().trim();
+
+      if (text) {
+        console.log(
+          "[FFMPEG HLS]",
+          text
+        );
+      }
+    }
+  );
+
+
+  ffmpegHLS.on(
+    "close",
+    (code, signal) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      console.log(
+        "FFmpeg HLS stopped:",
+        code,
+        signal
+      );
+
+      ffmpegHLS = null;
+    }
+  );
+
+
+  ffmpegHLS.on(
+    "error",
+    (err) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      console.error(
+        "FFmpeg HLS error:",
+        err.message
+      );
+    }
+  );
+}
+
+
+// ======================================================
+// SEPARATE AUDIO PROCESS
+// ======================================================
+
+function startAudio(channel, mySession) {
+
+  console.log(
+    "START AUDIO:",
+    channel.name
+  );
+
+  const args = [
+
+    "-hide_banner",
+
+    "-loglevel",
+    "warning",
+
+    "-reconnect",
+    "1",
+
+    "-reconnect_streamed",
+    "1",
+
+    "-reconnect_delay_max",
+    "5",
+
+    "-fflags",
+    "nobuffer",
+
+    "-i",
+    channel.url,
+
+    "-vn",
+
+    "-ac",
+    "1",
+
+    "-ar",
+    "44100",
+
+    "-c:a",
+    "pcm_s16le",
+
+    "-f",
+    "s16le",
+
+    "pipe:1"
+  ];
+
+  ffmpegAudio = spawn(
+    "ffmpeg",
+    args,
+    {
+      stdio: [
+        "ignore",
+        "pipe",
+        "pipe"
+      ]
+    }
+  );
+
+
+  ffmpegAudio.stdout.on(
+    "data",
+    (chunk) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      audioQueue.push(
+        Buffer.from(chunk)
+      );
+
+      stats.audioBytes +=
+        chunk.length;
+
+      // --------------------------------------
+      // Giới hạn buffer audio
+      // --------------------------------------
+
+      let total = 0;
+
+      for (let i = audioQueue.length - 1; i >= 0; i--) {
+
+        total +=
+          audioQueue[i].length;
+
+        if (
+          total >
+          MAX_AUDIO_BUFFER
+        ) {
+
+          audioQueue =
+            audioQueue.slice(i);
+
+          break;
+        }
+      }
+    }
+  );
+
+
+  ffmpegAudio.stderr.on(
+    "data",
+    (data) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      const text =
+        data.toString().trim();
+
+      if (text) {
+        console.log(
+          "[FFMPEG AUDIO]",
+          text
+        );
+      }
+    }
+  );
+
+
+  ffmpegAudio.on(
+    "close",
+    (code, signal) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      console.log(
+        "FFmpeg AUDIO stopped:",
+        code,
+        signal
+      );
+
+      ffmpegAudio = null;
+    }
+  );
+
+
+  ffmpegAudio.on(
+    "error",
+    (err) => {
+
+      if (mySession !== sessionId) {
+        return;
+      }
+
+      console.error(
+        "FFmpeg AUDIO error:",
+        err.message
+      );
+    }
+  );
+}
+
+
+// ======================================================
+// START CHANNEL
+// ======================================================
+
+function startChannel(index) {
+
+  if (
+    index < 0 ||
+    index >= channels.length
+  ) {
+    return false;
   }
-);
+
+  const channel =
+    channels[index];
+
+  currentIndex = index;
+  currentChannel = channel;
+
+  stopCurrentSession();
+
+  // stopCurrentSession() increments sessionId
+  const mySession = sessionId;
+
+  console.log("");
+  console.log("##########################################");
+  console.log(
+    "CHANNEL:",
+    index,
+    "/",
+    channels.length - 1
+  );
+
+  console.log(
+    "NAME:",
+    channel.name
+  );
+
+  console.log(
+    "URL:",
+    channel.url
+  );
+
+  console.log(
+    "SESSION:",
+    mySession
+  );
+
+  console.log("##########################################");
+  console.log("");
+
+  channel.live = null;
+  channel.error = null;
+
+  startVideo(
+    channel,
+    mySession
+  );
+
+  startHLS(
+    channel,
+    mySession
+  );
+
+  startAudio(
+    channel,
+    mySession
+  );
+
+  return true;
+}
 
 
-// ============================================================
-// WEB UI
-// ============================================================
+// ======================================================
+// NEXT CHANNEL
+// ======================================================
+
+function nextChannel() {
+
+  if (channels.length === 0) {
+    return false;
+  }
+
+  let next =
+    currentIndex + 1;
+
+  if (next >= channels.length) {
+    next = 0;
+  }
+
+  return startChannel(next);
+}
+
+
+// ======================================================
+// EXPRESS
+// ======================================================
+
+// ------------------------------------------------------
+// HOME
+// ------------------------------------------------------
 
 app.get(
   "/",
   (req, res) => {
 
-    res.send(`
-<!DOCTYPE html>
-
+    res.send(`<!DOCTYPE html>
 <html lang="vi">
 
 <head>
@@ -2313,7 +1112,7 @@ app.get(
 
 <meta
   name="viewport"
-  content="width=device-width,initial-scale=1"
+  content="width=device-width, initial-scale=1.0"
 >
 
 <title>IPTV Server</title>
@@ -2321,41 +1120,39 @@ app.get(
 <style>
 
 body {
-  margin: 0;
-  background: #111;
-  color: white;
-  font-family: Arial;
+  background:#111;
+  color:#fff;
+  font-family:Arial,sans-serif;
+  margin:0;
+  padding:20px;
 }
 
-.container {
-  max-width: 900px;
-  margin: auto;
-  padding: 15px;
+video,
+img {
+  width:320px;
+  height:240px;
+  background:#000;
+  object-fit:contain;
+  display:block;
+  margin-bottom:15px;
 }
 
-select,
 button {
-  font-size: 16px;
-  padding: 10px;
-  margin: 4px;
+  padding:10px 16px;
+  margin:4px;
+  font-size:16px;
 }
 
-video {
-  width: 100%;
-  max-height: 500px;
-  background: black;
-}
-
-#mjpeg {
-  width: 320px;
-  height: 240px;
-  background: black;
-  image-rendering: auto;
+select {
+  padding:10px;
+  width:320px;
+  max-width:100%;
 }
 
 pre {
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space:pre-wrap;
+  background:#222;
+  padding:10px;
 }
 
 </style>
@@ -2364,263 +1161,131 @@ pre {
 
 <body>
 
-<div class="container">
-
 <h2>IPTV Server</h2>
 
 <select id="channels"></select>
 
+<br><br>
+
 <button onclick="playSelected()">
-Phát
+Phát kênh
 </button>
 
 <button onclick="nextChannel()">
 Kênh tiếp
 </button>
 
-<h3>HLS + Audio</h3>
+<h3>HLS</h3>
 
 <video
   id="video"
   controls
   autoplay
-  playsinline>
-</video>
+  playsinline
+></video>
 
-<h3>MJPEG 320x240</h3>
+<h3>MJPEG ESP32</h3>
 
 <img
   id="mjpeg"
   src="/stream"
->
+/>
 
-<h3>Health</h3>
+<h3>Stats</h3>
 
-<pre id="stats"></pre>
-
-</div>
+<pre id="stats">
+Loading...
+</pre>
 
 <script>
 
-// ==========================================================
-// LOAD CHANNELS
-// ==========================================================
+const select =
+  document.getElementById("channels");
+
+const video =
+  document.getElementById("video");
 
 async function loadChannels() {
 
-  try {
-
-    const response =
-      await fetch(
-        "/api/channels?t=" +
-        Date.now()
-      );
-
-    const channels =
-      await response.json();
-
-    const select =
-      document.getElementById(
-        "channels"
-      );
-
-    const oldValue =
-      select.value;
-
-    select.innerHTML = "";
-
-    channels.forEach(
-      (channel, index) => {
-
-        const option =
-          document.createElement(
-            "option"
-          );
-
-        option.value =
-          index;
-
-        if (
-          channel.live === true
-        ) {
-
-          option.textContent =
-            "🟢 " +
-            channel.name;
-
-          option.disabled =
-            false;
-
-        } else if (
-          channel.live === false
-        ) {
-
-          option.textContent =
-            "🔴 " +
-            channel.name;
-
-          option.disabled =
-            true;
-
-        } else {
-
-          option.textContent =
-            "🟡 " +
-            channel.name;
-
-          option.disabled =
-            true;
-        }
-
-        select.appendChild(
-          option
-        );
-      }
-    );
-
-    // Giữ lựa chọn cũ
-    const option =
-      Array.from(
-        select.options
-      ).find(
-        o =>
-          o.value === oldValue &&
-          !o.disabled
-      );
-
-    if (option) {
-
-      select.value =
-        oldValue;
-    }
-
-  } catch (err) {
-
-    console.error(err);
-  }
-}
-
-
-// ==========================================================
-// PLAY
-// ==========================================================
-
-async function playSelected() {
-
-  const select =
-    document.getElementById(
-      "channels"
-    );
-
-  const index =
-    Number(
-      select.value
-    );
-
   const response =
-    await fetch(
-      "/api/channel/" +
-      index,
-      {
-        method: "POST"
-      }
-    );
+    await fetch("/api/channels");
 
-  const result =
+  const data =
     await response.json();
 
-  if (!result.ok) {
+  select.innerHTML = "";
 
-    alert(
-      result.error ||
-      "Không thể phát"
-    );
+  for (const ch of data.channels) {
 
-    return;
+    const option =
+      document.createElement("option");
+
+    option.value =
+      ch.index;
+
+    option.textContent =
+      ch.index +
+      " - " +
+      ch.name;
+
+    select.appendChild(option);
   }
-
-  startHLSVideo();
 }
 
 
-// ==========================================================
-// START HLS VIDEO
-// ==========================================================
+function playSelected() {
 
-function startHLSVideo() {
+  const index =
+    Number(select.value);
 
-  const video =
-    document.getElementById(
-      "video"
-    );
+  fetch(
+    "/api/channel/" + index
+  )
+  .then(() => {
 
-  // Xóa URL cũ
-  video.src = "";
-
-  setTimeout(
-    () => {
+    setTimeout(() => {
 
       video.src =
         "/hls/index.m3u8?t=" +
         Date.now();
 
-      video.load();
-
       video.play()
-        .catch(
-          () => {}
-        );
+        .catch(() => {});
 
-    },
-    1000
-  );
+    }, 1500);
+
+  });
 }
 
 
-// ==========================================================
-// NEXT
-// ==========================================================
+function nextChannel() {
 
-async function nextChannel() {
+  fetch("/api/next")
+    .then(() => {
 
-  const response =
-    await fetch(
-      "/api/next",
-      {
-        method: "POST"
-      }
-    );
+      setTimeout(() => {
 
-  const result =
-    await response.json();
+        video.src =
+          "/hls/index.m3u8?t=" +
+          Date.now();
 
-  if (!result.ok) {
+        video.play()
+          .catch(() => {});
 
-    alert(
-      result.error ||
-      "Không có channel LIVE"
-    );
+        loadChannels();
 
-    return;
-  }
+      }, 1500);
 
-  startHLSVideo();
+    });
 }
 
-
-// ==========================================================
-// HEALTH
-// ==========================================================
 
 async function updateStats() {
 
   try {
 
     const response =
-      await fetch(
-        "/health?t=" +
-        Date.now()
-      );
+      await fetch("/api/current");
 
     const data =
       await response.json();
@@ -2634,139 +1299,431 @@ async function updateStats() {
         2
       );
 
-  } catch {}
+  } catch (_) {}
+
 }
 
 
-// ==========================================================
-// REFRESH
-// ==========================================================
-
-setInterval(
-  loadChannels,
-  10000
-);
+loadChannels();
 
 setInterval(
   updateStats,
   1000
 );
 
-loadChannels();
-
-updateStats();
-
 </script>
 
 </body>
-
-</html>
-`);
+</html>`);
   }
 );
 
 
-// ============================================================
-// MAIN
-// ============================================================
+// ======================================================
+// MJPEG STREAM
+// ======================================================
+
+app.get(
+  "/stream",
+  (req, res) => {
+
+    res.setHeader(
+      "Content-Type",
+      "multipart/x-mixed-replace; boundary=frame"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-cache, no-store, must-revalidate"
+    );
+
+    res.setHeader(
+      "Pragma",
+      "no-cache"
+    );
+
+    res.setHeader(
+      "Connection",
+      "keep-alive"
+    );
+
+    res.flushHeaders();
+
+    const client = {
+      res
+    };
+
+    mjpegClients.add(client);
+
+    req.on(
+      "close",
+      () => {
+        mjpegClients.delete(client);
+      }
+    );
+  }
+);
+
+
+// ======================================================
+// HLS PLAYLIST
+// ======================================================
+
+app.get(
+  "/hls/index.m3u8",
+  (req, res) => {
+
+    if (!currentChannel) {
+      return res
+        .status(404)
+        .send("No channel");
+    }
+
+    const dir =
+      path.join(
+        TMP_ROOT,
+        `hls-${sessionId}`
+      );
+
+    const playlist =
+      path.join(
+        dir,
+        "index.m3u8"
+      );
+
+    if (!fs.existsSync(playlist)) {
+      return res
+        .status(404)
+        .send("HLS not ready");
+    }
+
+    try {
+
+      let data =
+        fs.readFileSync(
+          playlist,
+          "utf8"
+        );
+
+      // --------------------------------------
+      // Rewrite TS segment URL
+      // --------------------------------------
+
+      data =
+        data.replace(
+          /^([^#\r\n]+\.ts)$/gm,
+          "/hls-segment/$1"
+        );
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.apple.mpegurl"
+      );
+
+      res.setHeader(
+        "Cache-Control",
+        "no-cache, no-store, must-revalidate"
+      );
+
+      res.send(data);
+
+    } catch (err) {
+
+      res
+        .status(500)
+        .send(err.message);
+    }
+  }
+);
+
+
+// ======================================================
+// HLS SEGMENT
+// ======================================================
+
+app.get(
+  "/hls-segment/:file",
+  (req, res) => {
+
+    const dir =
+      path.join(
+        TMP_ROOT,
+        `hls-${sessionId}`
+      );
+
+    const file =
+      path.basename(
+        req.params.file
+      );
+
+    const fullPath =
+      path.join(
+        dir,
+        file
+      );
+
+    if (!fs.existsSync(fullPath)) {
+      return res
+        .status(404)
+        .send("Segment not found");
+    }
+
+    res.setHeader(
+      "Content-Type",
+      "video/mp2t"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-cache"
+    );
+
+    res.sendFile(
+      fullPath
+    );
+  }
+);
+
+
+// ======================================================
+// CHANNEL API
+// ======================================================
+
+app.get(
+  "/api/channels",
+  (req, res) => {
+
+    res.json({
+      count: channels.length,
+
+      checking: false,
+
+      channels:
+        channels.map(ch => ({
+          index: ch.index,
+
+          name: ch.name,
+
+          tvgId: ch.tvgId,
+
+          group: ch.group,
+
+          logo: ch.logo,
+
+          url: ch.url,
+
+          live: ch.live,
+
+          error: ch.error,
+
+          status:
+            ch.index === currentIndex
+              ? "current"
+              : "unchecked"
+        }))
+    });
+  }
+);
+
+
+// ======================================================
+// CURRENT
+// ======================================================
+
+app.get(
+  "/api/current",
+  (req, res) => {
+
+    res.json({
+      ok: true,
+
+      index: currentIndex,
+
+      channel: currentChannel
+        ? {
+            index:
+              currentChannel.index,
+
+            name:
+              currentChannel.name,
+
+            url:
+              currentChannel.url
+          }
+        : null,
+
+      session:
+        sessionId,
+
+      resolution:
+        `${WIDTH}x${HEIGHT}`,
+
+      targetFPS:
+        FPS,
+
+      stats
+    });
+  }
+);
+
+
+// ======================================================
+// SELECT CHANNEL
+// ======================================================
+
+app.get(
+  "/api/channel/:index",
+  (req, res) => {
+
+    const index =
+      Number(req.params.index);
+
+    if (
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= channels.length
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error: "Invalid channel"
+        });
+    }
+
+    startChannel(index);
+
+    res.json({
+      ok: true,
+
+      index,
+
+      channel:
+        channels[index].name,
+
+      message:
+        "Channel started"
+    });
+  }
+);
+
+
+// ======================================================
+// NEXT
+// ======================================================
+
+app.get(
+  "/api/next",
+  (req, res) => {
+
+    const ok =
+      nextChannel();
+
+    if (!ok) {
+      return res
+        .status(500)
+        .json({
+          ok: false
+        });
+    }
+
+    res.json({
+      ok: true,
+
+      index:
+        currentIndex,
+
+      channel:
+        currentChannel
+          ? currentChannel.name
+          : null
+    });
+  }
+);
+
+
+// ======================================================
+// HEALTH
+// ======================================================
+
+app.get(
+  "/health",
+  (req, res) => {
+
+    res.json({
+      ok: true,
+
+      channels:
+        channels.length,
+
+      currentIndex,
+
+      currentChannel:
+        currentChannel
+          ? currentChannel.name
+          : null,
+
+      session:
+        sessionId,
+
+      mjpegClients:
+        mjpegClients.size,
+
+      frameBuffer:
+        frameBuffer.length,
+
+      audioBuffer:
+        audioQueue.length
+    });
+  }
+);
+
+
+// ======================================================
+// START SERVER
+// ======================================================
 
 async function main() {
 
   try {
 
-    // --------------------------------------------------------
-    // LOAD ALL CHANNELS
-    // --------------------------------------------------------
-
-    channels =
-      await loadPlaylist();
-
-    if (
-      !channels.length
-    ) {
-
-      throw new Error(
-        "Playlist is empty"
-      );
-    }
-
-    // --------------------------------------------------------
-    // START SERVER NGAY
-    // --------------------------------------------------------
+    await loadPlaylist();
 
     app.listen(
       PORT,
+      "0.0.0.0",
       () => {
 
-        log(
-          `[SERVER] Running on port ${PORT}`
-        );
-
-        log(
-          `[SERVER] Port: ${PORT}`
-        );
-
-        log(
-          `[SERVER] /`
-        );
-
-        log(
-          `[SERVER] /stream`
-        );
-
-        log(
-          `[SERVER] /hls/index.m3u8`
-        );
-
-        log(
-          `[SERVER] /api/channels`
-        );
-
-        log(
-          `[SERVER] /health`
-        );
+        console.log("");
+        console.log("==========================================");
+        console.log("IPTV SERVER STARTED");
+        console.log("PORT:", PORT);
+        console.log("CHANNELS:", channels.length);
+        console.log("==========================================");
+        console.log("");
       }
     );
 
-    // --------------------------------------------------------
-    // CHECK ALL
-    // --------------------------------------------------------
+    // ----------------------------------------
+    // KHÔNG CHECK CHANNELS
+    // Phát thẳng kênh đầu tiên
+    // ----------------------------------------
 
-    await checkAllChannels();
+    if (channels.length > 0) {
 
-    // --------------------------------------------------------
-    // FIRST LIVE
-    // --------------------------------------------------------
-
-    const firstLive =
-      channels.findIndex(
-        channel =>
-          channel.live === true
-      );
-
-    if (
-      firstLive >= 0
-    ) {
-
-      log(
-        `[SERVER] First LIVE channel: ${firstLive}`
-      );
-
-      startChannel(
-        firstLive
-      );
+      startChannel(0);
 
     } else {
 
-      log(
-        "[SERVER] No LIVE channel found"
+      console.log(
+        "No channels found."
       );
     }
 
   } catch (err) {
 
     console.error(
-      "[FATAL]",
+      "SERVER START ERROR:",
       err
     );
 
@@ -2775,16 +1732,16 @@ async function main() {
 }
 
 
-// ============================================================
-// CLEANUP
-// ============================================================
+// ======================================================
+// PROCESS SIGNALS
+// ======================================================
 
 process.on(
   "SIGTERM",
   () => {
 
-    log(
-      "[SYSTEM] SIGTERM"
+    console.log(
+      "SIGTERM received"
     );
 
     stopCurrentSession();
@@ -2798,8 +1755,8 @@ process.on(
   "SIGINT",
   () => {
 
-    log(
-      "[SYSTEM] SIGINT"
+    console.log(
+      "SIGINT received"
     );
 
     stopCurrentSession();
@@ -2809,8 +1766,8 @@ process.on(
 );
 
 
-// ============================================================
+// ======================================================
 // RUN
-// ============================================================
+// ======================================================
 
 main();

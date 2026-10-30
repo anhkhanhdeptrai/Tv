@@ -96,6 +96,16 @@ let manuallyStopped = true;
 // M3U PARSER
 // =====================================================
 
+function parseResolutionFromName(name) {
+  const match = name.match(/\((\d{3,4})p\)|\b(\d{3,4})p\b/i);
+  if (!match) return 0;
+
+  const value = Number(match[1] || match[2]);
+  if (!Number.isFinite(value)) return 0;
+
+  return value;
+}
+
 function parseM3U(content) {
   const lines = content.split(/\r?\n/);
   const result = [];
@@ -136,12 +146,15 @@ function parseM3U(content) {
     const idMatch =
       currentInfo.match(/tvg-id="([^"]*)"/i);
 
+    const resolution = parseResolutionFromName(name);
+
     result.push({
       id: String(result.length),
       name,
       group: groupMatch ? groupMatch[1] : "",
       logo: logoMatch ? logoMatch[1] : "",
       tvgId: idMatch ? idMatch[1] : "",
+      resolution,
       url
     });
 
@@ -149,6 +162,20 @@ function parseM3U(content) {
   }
 
   return result;
+}
+
+function filterChannelsByResolution(list, maxResolution = 720) {
+  if (!Array.isArray(list)) return [];
+
+  const target = Number(maxResolution);
+  const allowed = Number.isFinite(target) ? target : 720;
+
+  const filtered = list.filter(channel => {
+    if (!channel || !channel.resolution) return true;
+    return channel.resolution <= allowed;
+  });
+
+  return filtered.length ? filtered : list;
 }
 
 // =====================================================
@@ -842,9 +869,25 @@ app.get("/audio", (req, res) => {
 // =====================================================
 
 app.get("/api/channels", (req, res) => {
+  const requested = req.query.quality || req.query.q || req.query.max || "720";
+  const rawValue = String(requested).trim().toLowerCase();
+
+  let maxResolution = 720;
+  if (rawValue === "all" || rawValue === "full") {
+    maxResolution = Number.MAX_SAFE_INTEGER;
+  } else {
+    const parsed = Number.parseInt(rawValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      maxResolution = parsed;
+    }
+  }
+
+  const filteredChannels = filterChannelsByResolution(channels, maxResolution);
+
   res.json({
     success: true,
-    channels
+    quality: maxResolution === Number.MAX_SAFE_INTEGER ? "all" : String(maxResolution),
+    channels: filteredChannels
   });
 });
 

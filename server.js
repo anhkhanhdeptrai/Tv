@@ -18,17 +18,22 @@ const WIDTH = 320;
 const HEIGHT = 240;
 const FPS = 10;
 
-const DELAY_SECONDS = 1;
-const BUFFER_SECONDS = 12;
+// Không tạo delay phía server
+const DELAY_SECONDS = 0;
 
-const MAX_BUFFER_FRAMES =
-  FPS * BUFFER_SECONDS;
+// CHỈ GIỮ FRAME MỚI NHẤT
+const MAX_LATEST_FRAMES = 2;
 
+// HLS
 const HLS_TIME = 2;
 const HLS_LIST = 8;
 
+// Check channel
 const CHECK_TIMEOUT = 7000;
 const CHECK_CONCURRENCY = 6;
+
+// Audio chỉ giữ buffer nhỏ để tránh audio chạy trước quá xa
+const MAX_AUDIO_BUFFER = 256 * 1024;
 
 // ======================================================
 // PATH
@@ -59,20 +64,29 @@ if (!fs.existsSync(HLS_DIR)) {
 let channels = [];
 let selectedChannel = null;
 
-// 3 FFmpeg riêng:
-// 1. HLS
-// 2. MJPEG
-// 3. Audio
 let ffmpegHLS = null;
 let ffmpegMJPEG = null;
 let ffmpegAudio = null;
 
+// ======================================================
+// MJPEG LOW LATENCY
+// ======================================================
+
+// KHÔNG lưu 120 frame nữa
+// Chỉ giữ tối đa 2 frame mới nhất
 let frames = [];
+
 let jpegBuffer = Buffer.alloc(0);
 
+// ======================================================
+// AUDIO
+// ======================================================
+
 let audioQueue = [];
-const MAX_AUDIO_BUFFER =
-  2 * 1024 * 1024;
+
+// ======================================================
+// STATS
+// ======================================================
 
 let statsTimer = null;
 
@@ -102,9 +116,7 @@ function getBufferSeconds() {
     return 0;
   }
 
-  const first =
-    frames[0].time;
-
+  const first = frames[0].time;
   const last =
     frames[frames.length - 1].time;
 
@@ -148,6 +160,10 @@ function resetStats() {
   };
 }
 
+// ======================================================
+// STATS
+// ======================================================
+
 function startStatsTimer() {
   if (statsTimer) {
     clearInterval(statsTimer);
@@ -158,6 +174,7 @@ function startStatsTimer() {
 
   statsTimer =
     setInterval(() => {
+
       const now = Date.now();
 
       const dt =
@@ -178,7 +195,8 @@ function startStatsTimer() {
       lastTime = now;
 
       console.log("");
-      console.log("==========");
+      console.log("==============================");
+
       console.log(
         "[STATS] Channel     :",
         selectedChannel
@@ -211,14 +229,13 @@ function startStatsTimer() {
       );
 
       console.log(
-        "[STATS] Buffer      :",
-        getBufferSeconds().toFixed(2) +
-          "s"
+        "[STATS] Frame buffer:",
+        frames.length
       );
 
       console.log(
-        "[STATS] Buffer frm  :",
-        frames.length
+        "[STATS] Buffer      :",
+        getBufferSeconds().toFixed(3) + "s"
       );
 
       console.log(
@@ -238,8 +255,9 @@ function startStatsTimer() {
           : "STOPPED"
       );
 
-      console.log("==========");
+      console.log("==============================");
       console.log("");
+
     }, 5000);
 }
 
@@ -248,14 +266,13 @@ function startStatsTimer() {
 // ======================================================
 
 async function loadPlaylist() {
+
   console.log(
     "Loading playlist..."
   );
 
   const response =
-    await fetch(
-      PLAYLIST_URL
-    );
+    await fetch(PLAYLIST_URL);
 
   if (!response.ok) {
     throw new Error(
@@ -278,21 +295,14 @@ async function loadPlaylist() {
 
   for (const line of lines) {
 
-    if (
-      line.startsWith(
-        "#EXTINF"
-      )
-    ) {
+    if (line.startsWith("#EXTINF")) {
+
       const comma =
         line.indexOf(",");
 
       const name =
         comma >= 0
-          ? line
-              .substring(
-                comma + 1
-              )
-              .trim()
+          ? line.substring(comma + 1).trim()
           : "Unknown";
 
       const logo =
@@ -324,9 +334,7 @@ async function loadPlaylist() {
       current.url = line;
 
       if (current.url) {
-        result.push(
-          current
-        );
+        result.push(current);
       }
 
       current = null;
@@ -344,97 +352,92 @@ async function loadPlaylist() {
 // CHECK CHANNEL
 // ======================================================
 
-async function checkChannel(
-  channel
-) {
-  return new Promise(
-    resolve => {
+async function checkChannel(channel) {
 
-      const ff =
-        spawn(
-          "ffprobe",
-          [
-            "-hide_banner",
-            "-loglevel",
-            "error",
+  return new Promise(resolve => {
 
-            "-timeout",
-            String(
-              CHECK_TIMEOUT * 1000
-            ),
+    const ff =
+      spawn(
+        "ffprobe",
+        [
+          "-hide_banner",
+          "-loglevel",
+          "error",
 
-            "-i",
-            channel.url,
+          "-timeout",
+          String(
+            CHECK_TIMEOUT * 1000
+          ),
 
-            "-show_entries",
-            "stream=codec_type",
+          "-i",
+          channel.url,
 
-            "-of",
-            "default=noprint_wrappers=1:nokey=1"
-          ],
-          {
-            stdio: [
-              "ignore",
-              "pipe",
-              "pipe"
-            ]
-          }
+          "-show_entries",
+          "stream=codec_type",
+
+          "-of",
+          "default=noprint_wrappers=1:nokey=1"
+        ],
+        {
+          stdio: [
+            "ignore",
+            "pipe",
+            "pipe"
+          ]
+        }
+      );
+
+    let output = "";
+
+    const timer =
+      setTimeout(() => {
+
+        try {
+          ff.kill("SIGKILL");
+        } catch {}
+
+        resolve(false);
+
+      }, CHECK_TIMEOUT);
+
+    ff.stdout.on(
+      "data",
+      data => {
+        output += data.toString();
+      }
+    );
+
+    ff.on(
+      "close",
+      code => {
+
+        clearTimeout(timer);
+
+        resolve(
+          code === 0 &&
+          output.includes("video")
         );
+      }
+    );
 
-      let output = "";
+    ff.on(
+      "error",
+      () => {
 
-      const timer =
-        setTimeout(() => {
+        clearTimeout(timer);
 
-          try {
-            ff.kill(
-              "SIGKILL"
-            );
-          } catch {}
-
-          resolve(false);
-
-        }, CHECK_TIMEOUT);
-
-      ff.stdout.on(
-        "data",
-        data => {
-          output +=
-            data.toString();
-        }
-      );
-
-      ff.on(
-        "close",
-        code => {
-
-          clearTimeout(timer);
-
-          resolve(
-            code === 0 &&
-            output.includes(
-              "video"
-            )
-          );
-        }
-      );
-
-      ff.on(
-        "error",
-        () => {
-
-          clearTimeout(timer);
-
-          resolve(false);
-        }
-      );
-    }
-  );
+        resolve(false);
+      }
+    );
+  });
 }
 
-async function filterChannels(
-  list
-) {
+// ======================================================
+// FILTER CHANNELS
+// ======================================================
+
+async function filterChannels(list) {
+
   const valid = [];
 
   let index = 0;
@@ -443,24 +446,18 @@ async function filterChannels(
 
     while (true) {
 
-      const i =
-        index++;
+      const i = index++;
 
-      if (
-        i >= list.length
-      ) {
+      if (i >= list.length) {
         return;
       }
 
-      const channel =
-        list[i];
+      const channel = list[i];
 
       try {
 
         const ok =
-          await checkChannel(
-            channel
-          );
+          await checkChannel(channel);
 
         if (ok) {
 
@@ -469,9 +466,7 @@ async function filterChannels(
             channel.name
           );
 
-          valid.push(
-            channel
-          );
+          valid.push(channel);
 
         } else {
 
@@ -498,14 +493,10 @@ async function filterChannels(
     i < CHECK_CONCURRENCY;
     i++
   ) {
-    workers.push(
-      worker()
-    );
+    workers.push(worker());
   }
 
-  await Promise.all(
-    workers
-  );
+  await Promise.all(workers);
 
   return valid;
 }
@@ -526,16 +517,12 @@ function stopFFmpeg() {
     ffmpegAudio
   ];
 
-  for (
-    const process of processes
-  ) {
+  for (const process of processes) {
 
     if (process) {
 
       try {
-        process.kill(
-          "SIGKILL"
-        );
+        process.kill("SIGKILL");
       } catch {}
     }
   }
@@ -545,8 +532,7 @@ function stopFFmpeg() {
   ffmpegAudio = null;
 
   frames = [];
-  jpegBuffer =
-    Buffer.alloc(0);
+  jpegBuffer = Buffer.alloc(0);
 
   audioQueue = [];
 
@@ -559,9 +545,7 @@ function stopFFmpeg() {
 // HLS FFMPEG
 // ======================================================
 
-function startHLSFFmpeg(
-  channel
-) {
+function startHLSFFmpeg(channel) {
 
   const playlist =
     path.join(
@@ -589,6 +573,7 @@ function startHLSFFmpeg(
 
         "-progress",
         "pipe:2",
+
         "-stats_period",
         "3",
 
@@ -599,10 +584,20 @@ function startHLSFFmpeg(
         "1",
 
         "-reconnect_delay_max",
-        "5",
+        "3",
 
+        // Low latency
         "-fflags",
         "nobuffer",
+
+        "-flags",
+        "low_delay",
+
+        "-analyzeduration",
+        "500k",
+
+        "-probesize",
+        "1M",
 
         "-i",
         channel.url,
@@ -613,11 +608,11 @@ function startHLSFFmpeg(
         "-map",
         "0:a:0?",
 
-        // HLS video copy
+        // Video không encode lại
         "-c:v",
         "copy",
 
-        // HLS audio
+        // Audio HLS
         "-c:a",
         "aac",
 
@@ -663,19 +658,14 @@ function startHLSFFmpeg(
         data.toString();
 
       const lines =
-        progressBuffer.split(
-          /\r?\n/
-        );
+        progressBuffer.split(/\r?\n/);
 
       progressBuffer =
         lines.pop() || "";
 
-      for (
-        const raw of lines
-      ) {
+      for (const raw of lines) {
 
-        const line =
-          raw.trim();
+        const line = raw.trim();
 
         if (!line) {
           continue;
@@ -685,65 +675,37 @@ function startHLSFFmpeg(
           line.indexOf("=");
 
         if (equal < 0) {
-          console.log(
-            "[HLS]",
-            line
-          );
-
+          console.log("[HLS]", line);
           continue;
         }
 
         const key =
-          line.substring(
-            0,
-            equal
-          );
+          line.substring(0, equal);
 
         const value =
-          line.substring(
-            equal + 1
-          );
+          line.substring(equal + 1);
 
-        if (
-          key === "speed"
-        ) {
+        if (key === "speed") {
 
           const n =
             parseFloat(
-              value.replace(
-                "x",
-                ""
-              )
+              value.replace("x", "")
             );
 
-          if (
-            Number.isFinite(n)
-          ) {
-            hlsStats.speed =
-              n;
+          if (Number.isFinite(n)) {
+            hlsStats.speed = n;
           }
-        }
 
-        else if (
-          key === "fps"
-        ) {
+        } else if (key === "fps") {
 
           const n =
-            parseFloat(
-              value
-            );
+            parseFloat(value);
 
-          if (
-            Number.isFinite(n)
-          ) {
-            hlsStats.fps =
-              n;
+          if (Number.isFinite(n)) {
+            hlsStats.fps = n;
           }
-        }
 
-        else if (
-          key === "frame"
-        ) {
+        } else if (key === "frame") {
 
           hlsStats.frame =
             Number(value) || 0;
@@ -778,15 +740,13 @@ function startHLSFFmpeg(
 }
 
 // ======================================================
-// MJPEG FFMPEG - SEPARATE
+// MJPEG FFMPEG - REALTIME
 // ======================================================
 
-function startMJPEGFFmpeg(
-  channel
-) {
+function startMJPEGFFmpeg(channel) {
 
   console.log(
-    "[MJPEG] Starting separate FFmpeg..."
+    "[MJPEG] Starting realtime decoder..."
   );
 
   ffmpegMJPEG =
@@ -799,8 +759,13 @@ function startMJPEGFFmpeg(
 
         "-progress",
         "pipe:2",
+
         "-stats_period",
-        "3",
+        "2",
+
+        // ============================================
+        // RECONNECT
+        // ============================================
 
         "-reconnect",
         "1",
@@ -809,11 +774,29 @@ function startMJPEGFFmpeg(
         "1",
 
         "-reconnect_delay_max",
-        "5",
+        "2",
+
+        // ============================================
+        // LOW LATENCY INPUT
+        // ============================================
 
         "-fflags",
         "nobuffer",
 
+        "-flags",
+        "low_delay",
+
+        "-avioflags",
+        "direct",
+
+        "-analyzeduration",
+        "500k",
+
+        "-probesize",
+        "1M",
+
+        // QUAN TRỌNG:
+        // KHÔNG dùng -re
         "-i",
         channel.url,
 
@@ -827,24 +810,29 @@ function startMJPEGFFmpeg(
         "0:v:0",
 
         // ============================================
-        // GIẢM TẢI
+        // GIẢM OUTPUT
         // ============================================
 
         "-vf",
         `fps=${FPS},scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
 
         // ============================================
-        // JPEG
+        // MJPEG
         // ============================================
 
         "-c:v",
         "mjpeg",
 
+        // JPEG nhẹ hơn
         "-q:v",
-        "14",
+        "18",
 
         "-fps_mode",
         "cfr",
+
+        // Flush ngay
+        "-flush_packets",
+        "1",
 
         "-f",
         "image2pipe",
@@ -888,7 +876,7 @@ function startMJPEGFFmpeg(
 
           if (
             jpegBuffer.length >
-            1024 * 1024
+            512 * 1024
           ) {
             jpegBuffer =
               Buffer.alloc(0);
@@ -921,19 +909,21 @@ function startMJPEGFFmpeg(
             end + 2
           );
 
-        frames.push({
-          data: Buffer.from(
-            jpeg
-          ),
+        // ==========================================
+        // CHỈ GIỮ FRAME MỚI NHẤT
+        // ==========================================
 
+        frames.push({
+          data: Buffer.from(jpeg),
           time: Date.now()
         });
 
         mjpegStats.totalFrames++;
 
+        // Không cho frame cũ tồn tại lâu
         while (
           frames.length >
-          MAX_BUFFER_FRAMES
+          MAX_LATEST_FRAMES
         ) {
           frames.shift();
         }
@@ -955,19 +945,14 @@ function startMJPEGFFmpeg(
         data.toString();
 
       const lines =
-        progressBuffer.split(
-          /\r?\n/
-        );
+        progressBuffer.split(/\r?\n/);
 
       progressBuffer =
         lines.pop() || "";
 
-      for (
-        const raw of lines
-      ) {
+      for (const raw of lines) {
 
-        const line =
-          raw.trim();
+        const line = raw.trim();
 
         if (!line) {
           continue;
@@ -997,46 +982,18 @@ function startMJPEGFFmpeg(
             equal + 1
           );
 
-        if (
-          key === "speed"
-        ) {
+        if (key === "speed") {
 
           const n =
             parseFloat(
-              value.replace(
-                "x",
-                ""
-              )
+              value.replace("x", "")
             );
 
-          if (
-            Number.isFinite(n)
-          ) {
-            mjpegStats.speed =
-              n;
+          if (Number.isFinite(n)) {
+            mjpegStats.speed = n;
           }
-        }
 
-        else if (
-          key === "fps"
-        ) {
-
-          const n =
-            parseFloat(
-              value
-            );
-
-          if (
-            Number.isFinite(n)
-          ) {
-            // Đây là FPS nội bộ FFmpeg
-            // MJPEG FPS thật được tính riêng
-          }
-        }
-
-        else if (
-          key === "frame"
-        ) {
+        } else if (key === "frame") {
 
           mjpegStats.frame =
             Number(value) || 0;
@@ -1074,9 +1031,7 @@ function startMJPEGFFmpeg(
 // AUDIO FFMPEG
 // ======================================================
 
-function startAudioFFmpeg(
-  channel
-) {
+function startAudioFFmpeg(channel) {
 
   console.log(
     "[AUDIO] Starting..."
@@ -1097,10 +1052,19 @@ function startAudioFFmpeg(
         "1",
 
         "-reconnect_delay_max",
-        "5",
+        "3",
 
         "-fflags",
         "nobuffer",
+
+        "-flags",
+        "low_delay",
+
+        "-analyzeduration",
+        "500k",
+
+        "-probesize",
+        "1M",
 
         "-i",
         channel.url,
@@ -1145,13 +1109,12 @@ function startAudioFFmpeg(
       for (
         const chunk of audioQueue
       ) {
-        total +=
-          chunk.length;
+        total += chunk.length;
       }
 
+      // Không cho audio chạy trước quá xa
       while (
-        total >
-        MAX_AUDIO_BUFFER &&
+        total > MAX_AUDIO_BUFFER &&
         audioQueue.length
       ) {
 
@@ -1188,9 +1151,7 @@ function startAudioFFmpeg(
         "[AUDIO] stopped"
       );
 
-      audioStats.running =
-        false;
-
+      audioStats.running = false;
       ffmpegAudio = null;
     }
   );
@@ -1204,8 +1165,7 @@ function startAudioFFmpeg(
         err.message
       );
 
-      audioStats.running =
-        false;
+      audioStats.running = false;
     }
   );
 }
@@ -1214,9 +1174,7 @@ function startAudioFFmpeg(
 // START CHANNEL
 // ======================================================
 
-function startChannel(
-  channel
-) {
+function startChannel(channel) {
 
   stopFFmpeg();
 
@@ -1227,35 +1185,35 @@ function startChannel(
   console.log(
     "================================"
   );
+
   console.log(
     "CHANNEL:",
     channel.name
   );
+
   console.log(
     "URL:",
     channel.url
   );
+
   console.log(
     "MJPEG:",
     `${WIDTH}x${HEIGHT} @ ${FPS} FPS`
   );
+
+  console.log(
+    "MODE: REALTIME / LATEST FRAME"
+  );
+
   console.log(
     "================================"
   );
+
   console.log("");
 
-  // Ba process riêng
-  startHLSFFmpeg(
-    channel
-  );
-
-  startMJPEGFFmpeg(
-    channel
-  );
-
-  startAudioFFmpeg(
-    channel
-  );
+  startHLSFFmpeg(channel);
+  startMJPEGFFmpeg(channel);
+  startAudioFFmpeg(channel);
 
   startStatsTimer();
 }
@@ -1288,24 +1246,18 @@ app.get(
       }
     );
 
-    let lastFrameTime = 0;
-    let frameIndex =
-      Math.max(
-        0,
-        frames.length - 1
-      );
-
     let closed = false;
+    let lastFrameTime = 0;
+
+    const frameInterval =
+      1000 / FPS;
 
     const timer =
       setInterval(
         () => {
 
           if (closed) {
-            clearInterval(
-              timer
-            );
-
+            clearInterval(timer);
             return;
           }
 
@@ -1313,33 +1265,18 @@ app.get(
             Date.now();
 
           // ==========================================
-          // VIDEO 10 FPS
+          // VIDEO
           // ==========================================
 
           if (
-            frames.length &&
+            frames.length > 0 &&
             now - lastFrameTime >=
-              1000 / FPS
+              frameInterval
           ) {
 
-            // Nếu client bị tụt quá xa,
-            // nhảy tới frame mới nhất.
-            if (
-              frameIndex <
-              frames.length - 20
-            ) {
-              frameIndex =
-                frames.length - 1;
-            }
-
-            frameIndex =
-              Math.min(
-                frameIndex,
-                frames.length - 1
-              );
-
+            // LUÔN LẤY FRAME MỚI NHẤT
             const frame =
-              frames[frameIndex];
+              frames[frames.length - 1];
 
             if (frame) {
 
@@ -1370,15 +1307,11 @@ app.get(
                 lastFrameTime =
                   now;
 
-                frameIndex++;
-
               } catch {
 
                 closed = true;
 
-                clearInterval(
-                  timer
-                );
+                clearInterval(timer);
               }
             }
           }
@@ -1388,7 +1321,7 @@ app.get(
           // ==========================================
 
           if (
-            audioQueue.length
+            audioQueue.length > 0
           ) {
 
             const audioChunk =
@@ -1422,9 +1355,7 @@ app.get(
 
               closed = true;
 
-              clearInterval(
-                timer
-              );
+              clearInterval(timer);
             }
           }
 
@@ -1438,9 +1369,7 @@ app.get(
 
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
 
@@ -1450,9 +1379,7 @@ app.get(
 
         closed = true;
 
-        clearInterval(
-          timer
-        );
+        clearInterval(timer);
       }
     );
   }
@@ -1473,9 +1400,7 @@ app.get(
       );
 
     if (
-      !fs.existsSync(
-        playlist
-      )
+      !fs.existsSync(playlist)
     ) {
 
       return res
@@ -1551,9 +1476,8 @@ app.get(
       "no-cache"
     );
 
-    fs.createReadStream(
-      file
-    ).pipe(res);
+    fs.createReadStream(file)
+      .pipe(res);
   }
 );
 
@@ -1579,6 +1503,8 @@ app.get(
       targetFPS:
         FPS,
 
+      lowLatency: true,
+
       stats: {
 
         hls: {
@@ -1593,6 +1519,7 @@ app.get(
         },
 
         mjpeg: {
+
           frame:
             mjpegStats.frame,
 
@@ -1613,6 +1540,7 @@ app.get(
         },
 
         audio: {
+
           running:
             audioStats.running,
 
@@ -1636,12 +1564,9 @@ app.get(
       channels.map(
         (channel, index) => ({
           id: index,
-          name:
-            channel.name,
-          logo:
-            channel.logo,
-          group:
-            channel.group
+          name: channel.name,
+          logo: channel.logo,
+          group: channel.group
         })
       )
     );
@@ -1657,9 +1582,7 @@ app.get(
   (req, res) => {
 
     const id =
-      Number(
-        req.params.id
-      );
+      Number(req.params.id);
 
     if (
       !Number.isInteger(id) ||
@@ -1879,9 +1802,7 @@ app.listen(
       );
 
       channels =
-        await filterChannels(
-          list
-        );
+        await filterChannels(list);
 
       console.log(
         `Valid channels: ${channels.length}`

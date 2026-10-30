@@ -18,8 +18,10 @@ const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 180;
 const VIDEO_FPS = 8;
 const JPEG_QUALITY = 8;
+
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
+// Audio
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
@@ -40,10 +42,16 @@ const AUDIO_BUFFER_MAX =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_BUFFER_MS / 1000;
 
-const AUDIO_INTERVAL = AUDIO_FRAME_MS;
+// Decoder optimization
+const DECODER_THREADS = 2;
+const ENCODER_THREADS = 1;
 
+// Skip non-reference frames to reduce decoder workload
+const SKIP_NON_REFERENCE = true;
+
+// Watchdog
 const WATCHDOG_INTERVAL = 5000;
-const VIDEO_TIMEOUT = 30000;
+const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
 const MAX_VIDEO_BUFFER = 4 * 1024 * 1024;
@@ -61,8 +69,9 @@ let generation = 0;
 let latestFrame = null;
 let frameSequence = 0;
 
-let audioBuffer = Buffer.alloc(0);
+let jpegPending = Buffer.alloc(0);
 
+let audioBuffer = Buffer.alloc(0);
 let audioClient = null;
 let audioTimer = null;
 
@@ -76,8 +85,6 @@ let lastVideoFrameTime = 0;
 
 let restarting = false;
 let manuallyStopped = true;
-
-let jpegPending = Buffer.alloc(0);
 
 // =====================================================
 // M3U PARSER
@@ -100,7 +107,6 @@ function parseM3U(content) {
     }
 
     if (line.startsWith("#")) continue;
-
     if (!currentInfo) continue;
 
     const url = line;
@@ -201,6 +207,7 @@ function disconnectAudioClient() {
   const oldClient = audioClient;
 
   audioClient = null;
+
   audioBlocked = false;
   audioBlockedSince = 0;
 
@@ -277,7 +284,7 @@ function startAudioTimer() {
 
     if (audioBlocked) {
       if (Date.now() - audioBlockedSince > 1500) {
-        console.log("[AUDIO] Client too slow");
+        console.log("[AUDIO] Slow client disconnected");
 
         disconnectAudioClient();
       }
@@ -314,6 +321,7 @@ function startAudioTimer() {
 
 function clearVideoBuffer() {
   jpegPending = Buffer.alloc(0);
+
   latestFrame = null;
   frameSequence = 0;
 }
@@ -435,56 +443,83 @@ function startFFmpeg(channel) {
   console.log("START CHANNEL:", channel.name);
   console.log("URL:", channel.url);
   console.log("GENERATION:", currentGeneration);
-  console.log("SOURCE MODE: UNIFIED");
+  console.log("SOURCE: ORIGINAL RESOLUTION");
+  console.log("DECODER THREADS:", DECODER_THREADS);
+  console.log("SKIP NONREF:", SKIP_NON_REFERENCE);
   console.log("OUTPUT:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
   console.log("FPS:", VIDEO_FPS);
   console.log("AUDIO:", AUDIO_SAMPLE_RATE, "Hz");
-  console.log("REALTIME: ON");
+  console.log("LIVE HLS MODE: ON");
   console.log("======================================");
 
   lastVideoFrameTime = Date.now();
 
   // =================================================
-  // UNIFIED FFMPEG PIPELINE
-  // 720P / 1080P / OTHER RESOLUTIONS
+  // FFMPEG ARGUMENTS
   // =================================================
 
   const args = [
     "-hide_banner",
     "-loglevel", "warning",
 
-    // Real-time input control
-    "-re",
+    // ===============================================
+    // INPUT NETWORK
+    // ===============================================
 
-    // HTTP reconnect
+    "-rw_timeout", "30000000",
+
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_at_eof", "1",
-    "-reconnect_delay_max", "5",
-
-    "-rw_timeout", "15000000",
+    "-reconnect_delay_max", "10",
 
     "-user_agent",
     "Mozilla/5.0",
 
-    "-thread_queue_size", "512",
+    // Discard corrupted packets
+    "-fflags",
+    "+discardcorrupt+genpts",
 
-    // All source resolutions use same input
+    // ===============================================
+    // DECODER OPTIMIZATION
+    // These options must be BEFORE -i
+    // ===============================================
+
+    "-threads",
+    String(DECODER_THREADS),
+
+    ...(SKIP_NON_REFERENCE
+      ? ["-skip_frame", "noref"]
+      : []),
+
+    // ===============================================
+    // INPUT
+    // No -re: HLS is already a live network source.
+    // ===============================================
+
     "-i", channel.url,
 
     // ===============================================
-    // VIDEO
+    // VIDEO OUTPUT
     // ===============================================
 
     "-map", "0:v:0?",
     "-an",
 
+    // Drop frames before scaling.
+    // Fast scaler reduces CPU workload.
     "-vf",
-    `fps=${VIDEO_FPS}:round=near,scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+    [
+      `fps=${VIDEO_FPS}:round=near`,
+      `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear`,
+      `pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+      "setsar=1"
+    ].join(","),
 
     "-q:v", String(JPEG_QUALITY),
 
-    "-threads", "2",
+    "-threads",
+    String(ENCODER_THREADS),
 
     "-flush_packets", "1",
 
@@ -494,14 +529,13 @@ function startFFmpeg(channel) {
     "pipe:1",
 
     // ===============================================
-    // AUDIO
+    // AUDIO OUTPUT
     // ===============================================
 
     "-map", "0:a:0?",
     "-vn",
 
-    // Preserve source timestamps and synchronize
-    // audio samples to the input timeline.
+    // Synchronize samples to source timestamps.
     "-af",
     `aresample=${AUDIO_SAMPLE_RATE}:async=1000:first_pts=0`,
 
@@ -528,12 +562,18 @@ function startFFmpeg(channel) {
 
   const processRef = ffmpeg;
 
+  // =================================================
   // VIDEO PIPE
+  // =================================================
+
   processRef.stdout.on("data", chunk => {
     processVideoData(chunk, currentGeneration);
   });
 
+  // =================================================
   // AUDIO PIPE
+  // =================================================
+
   if (processRef.stdio[3]) {
     processRef.stdio[3].on("data", chunk => {
       if (currentGeneration !== generation) return;
@@ -542,7 +582,10 @@ function startFFmpeg(channel) {
     });
   }
 
+  // =================================================
   // STDERR
+  // =================================================
+
   processRef.stderr.on("data", data => {
     const message = data.toString().trim();
 
@@ -551,12 +594,18 @@ function startFFmpeg(channel) {
     }
   });
 
+  // =================================================
   // ERROR
+  // =================================================
+
   processRef.on("error", error => {
     console.error("[FFMPEG ERROR]", error.message);
   });
 
+  // =================================================
   // CLOSE
+  // =================================================
+
   processRef.on("close", (code, signal) => {
     console.log(
       "[FFmpeg] Exited:",
@@ -577,7 +626,10 @@ function startFFmpeg(channel) {
     }
   });
 
+  // =================================================
   // WATCHDOG
+  // =================================================
+
   watchdogTimer = setInterval(() => {
     if (currentGeneration !== generation) return;
 
@@ -869,7 +921,16 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "UNIFIED_REALTIME",
+    pipeline: "OPTIMIZED_LIVE_HLS",
+
+    sourceResolution: "ORIGINAL",
+
+    skipNonReferenceFrames:
+      SKIP_NON_REFERENCE,
+
+    decoderThreads: DECODER_THREADS,
+
+    encoderThreads: ENCODER_THREADS,
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -879,6 +940,7 @@ app.get("/health", (req, res) => {
     audioChannels: AUDIO_CHANNELS,
 
     audioFrameBytes: AUDIO_FRAME_BYTES,
+
     audioBufferBytes: audioBuffer.length,
     audioBufferMax: AUDIO_BUFFER_MAX,
 
@@ -886,6 +948,7 @@ app.get("/health", (req, res) => {
       !!audioClient && !audioClient.destroyed,
 
     lastVideoFrameTime,
+
     generation
   });
 });
@@ -900,7 +963,9 @@ app.get("/", (req, res) => {
 
     <p>Channels: ${channels.length}</p>
 
-    <p>Pipeline: Unified realtime</p>
+    <p>Pipeline: OPTIMIZED LIVE HLS</p>
+
+    <p>Source: Original resolution</p>
 
     <p>Video: ${VIDEO_WIDTH}x${VIDEO_HEIGHT} @ ${VIDEO_FPS} FPS</p>
 
@@ -932,8 +997,9 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-    console.log("PIPELINE: UNIFIED");
-    console.log("REALTIME: ON");
+    console.log("PIPELINE: OPTIMIZED LIVE HLS");
+    console.log("SOURCE: ORIGINAL RESOLUTION");
+    console.log("SKIP NONREF:", SKIP_NON_REFERENCE);
     console.log("VIDEO:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
     console.log("FPS:", VIDEO_FPS);
     console.log("AUDIO:", AUDIO_SAMPLE_RATE);

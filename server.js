@@ -1,4 +1,3 @@
-
 const express = require("express");
 const { spawn } = require("child_process");
 
@@ -427,6 +426,10 @@ function startFFmpeg(channel) {
   stopFFmpeg();
 
   currentChannel = channel;
+  latestFrame = null;
+  frameSequence = 0;
+  jpegPending = Buffer.alloc(0);
+  clearAudioBuffer();
 
   const currentGeneration = generation;
 

@@ -37,7 +37,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_FRAME_MS / 1000;
 
-const AUDIO_BUFFER_MS = 500;
+const AUDIO_BUFFER_MS = 1500;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -78,6 +78,7 @@ let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
 let audioBuffer = Buffer.alloc(0);
+let lastAudioSample = Buffer.from([0, 0]);
 let audioClient = null;
 let audioTimer = null;
 
@@ -237,6 +238,7 @@ async function loadChannels() {
 
 function clearAudioBuffer() {
   audioBuffer = Buffer.alloc(0);
+  lastAudioSample = Buffer.from([0, 0]);
 }
 
 function disconnectAudioClient() {
@@ -275,13 +277,14 @@ function pushAudioBuffer(chunk) {
     chunk
   ]);
 
-  // Không để audio buffer tăng vô hạn
-  if (audioBuffer.length > AUDIO_BUFFER_MAX) {
+  // Chỉ trim khi buffer đã quá nặng hơn mức an toàn. Không cắt quá mạnh
+  // vì sẽ làm audio bị lặp / nhái trên những kênh có jitter thời gian dài.
+  if (audioBuffer.length > AUDIO_BUFFER_MAX * 1.25) {
     const excess =
       audioBuffer.length - AUDIO_BUFFER_MAX;
 
     const dropBytes =
-      excess + (excess % 2);
+      Math.max(2, excess + (excess % 2));
 
     audioBuffer =
       audioBuffer.subarray(dropBytes);
@@ -289,22 +292,34 @@ function pushAudioBuffer(chunk) {
 }
 
 function getAudioFrame() {
+  const frame = Buffer.alloc(AUDIO_FRAME_BYTES);
+
   if (audioBuffer.length >= AUDIO_FRAME_BYTES) {
-    const frame =
+    const out =
       audioBuffer.subarray(0, AUDIO_FRAME_BYTES);
 
     audioBuffer =
       audioBuffer.subarray(AUDIO_FRAME_BYTES);
 
+    if (out.length >= 2) {
+      lastAudioSample = Buffer.from(out.subarray(out.length - 2));
+    }
+
+    out.copy(frame, 0);
     return frame;
   }
 
-  // Nếu thiếu dữ liệu, đệm phần còn lại bằng silence
-  const frame = Buffer.alloc(AUDIO_FRAME_BYTES);
-
+  // Khi đệm thấp, giữ phần còn lại và lấp chỗ thiếu bằng mẫu cuối cùng.
+  // Tránh chèn silence liên tục khiến âm thanh "nhái" và rít mất nhịp.
   if (audioBuffer.length > 0) {
     audioBuffer.copy(frame, 0);
+    lastAudioSample = Buffer.from(frame.subarray(Math.max(0, audioBuffer.length - 2), audioBuffer.length));
     audioBuffer = Buffer.alloc(0);
+  }
+
+  for (let i = audioBuffer.length; i < AUDIO_FRAME_BYTES; i += 2) {
+    frame[i] = lastAudioSample[0];
+    frame[i + 1] = lastAudioSample[1];
   }
 
   return frame;

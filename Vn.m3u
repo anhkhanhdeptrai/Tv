@@ -1,6 +1,22 @@
 #EXTM3U
 #EXTINF:-1 tvg-id="HTV5.vn@HD",HTV5 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=151
+#EXTINF:-1 tvg-id="ONVieDrama.vn@SD",ON Vie Drama (720p)
+http://dvrfl05.bozztv.com/vch_vchannel18/index.m3u8
+#EXTINF:-1 tvg-id="ONMovies.vn@SD",ON Movies (720p)
+https://freem3u.xyz/api/live/play.m3u8?vid=181
+#EXTINF:-1 tvg-id="ONLife.vn@SD",ON Life (720p)
+https://freem3u.xyz/api/live/play.m3u8?vid=188
+#EXTINF:-1 tvg-id="ONKids.vn@SD",ON Kids (720p)
+https://freem3u.xyz/api/live/play.m3u8?vid=179
+#EXTINF:-1 tvg-id="HTV4.vn@SD",HTV4 (1080p)
+https://freem3u.xyz/api/live/play.m3u8?vid=9
+#EXTINF:-1 tvg-id="DienBienTV.vn@SD",Dien Bien TV (1080p)
+https://stream.langsontv.vn/live/2855dfeccb7f49a41a2b0441b3bfeda413c/playlist.m3u8
+#EXTINF:-1 tvg-id="CaoBangTV.vn@SD",Cao Bằng TV (720p)
+https://stream.thingnet.vn/live/smil:CRTV.smil/chunklist.m3u8
+#EXTINF:-1 tvg-id="CaMauTV.vn@SD",Cà Mau TV (720p) [Geo-blocked]
+https://tv.ctvcamau.vn/live/tv/tv.m3u8
 #EXTINF:-1 tvg-id="ONEChannel.vn@HD",ON E Channel (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=182
 #EXTINF:-1 tvg-id="ONO2TV.vn@SD",ON O2TV (1080p)
@@ -57,19 +73,4 @@ https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv18/master.m3u8
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv19/master.m3u8
 #EXTINF:-1 tvg-id="SCTV20.vn@SD",SCTV20 (720p)
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv20/master.m3u8
-#EXTINF:-1 tvg-id="ONVieDrama.vn@SD",ON Vie Drama (720p)
-http://dvrfl05.bozztv.com/vch_vchannel18/index.m3u8
-#EXTINF:-1 tvg-id="ONMovies.vn@SD",ON Movies (720p)
-https://freem3u.xyz/api/live/play.m3u8?vid=181
-#EXTINF:-1 tvg-id="ONLife.vn@SD",ON Life (720p)
-https://freem3u.xyz/api/live/play.m3u8?vid=188
-#EXTINF:-1 tvg-id="ONKids.vn@SD",ON Kids (720p)
-https://freem3u.xyz/api/live/play.m3u8?vid=179
-#EXTINF:-1 tvg-id="HTV4.vn@SD",HTV4 (1080p)
-https://freem3u.xyz/api/live/play.m3u8?vid=9
-#EXTINF:-1 tvg-id="DienBienTV.vn@SD",Dien Bien TV (1080p)
-https://stream.langsontv.vn/live/2855dfeccb7f49a41a2b0441b3bfeda413c/playlist.m3u8
-#EXTINF:-1 tvg-id="CaoBangTV.vn@SD",Cao Bằng TV (720p)
-https://stream.thingnet.vn/live/smil:CRTV.smil/chunklist.m3u8
-#EXTINF:-1 tvg-id="CaMauTV.vn@SD",Cà Mau TV (720p) [Geo-blocked]
-https://tv.ctvcamau.vn/live/tv/tv.m3u8
+
